@@ -288,6 +288,18 @@ def create_app(config=None):
         if type(revision) is not int:
             abort(400)
         with db() as q:
+            previous = q('SELECT revision,data FROM workspace WHERE id=1').fetchone()
+            if previous['revision'] != revision:
+                abort(409, 'База изменена другим сотрудником. Обнови данные и повтори изменение')
+            old_partners = {p['id']: p for p in json.loads(previous['data'])['partners']}
+            new_partners = {p['id']: p for p in data['partners']}
+            if g.user['role'] == 'member' and old_partners.keys() - new_partners.keys():
+                abort(403, 'Удалять контрагентов может только администратор. Поставь пометку на удаление')
+            deletion_fields = ('deletionRequested', 'deletionBy', 'deletionReason', 'deletionAt')
+            for pid, partner in new_partners.items():
+                old = old_partners.get(pid, {})
+                if any(partner.get(k) != old.get(k) for k in deletion_fields):
+                    abort(403, 'Пометка на удаление изменяется отдельной кнопкой')
             result = q('UPDATE workspace SET data=?,revision=revision+1 WHERE id=1 AND revision=?',
                        (json.dumps(data, ensure_ascii=False, allow_nan=False), revision))
             if not result.rowcount:
@@ -298,6 +310,53 @@ def create_app(config=None):
     def admin():
         if g.user['role'] not in ('owner','admin'):
             abort(403, 'Доступно только администратору')
+
+    @app.post('/api/partners/<pid>/deletion')
+    def partner_deletion(pid):
+        payload = request.get_json()
+        action, revision = payload.get('action'), payload.get('revision')
+        if action not in ('mark', 'cancel', 'delete') or type(revision) is not int:
+            abort(400, 'Неверный запрос')
+        if action in ('cancel', 'delete'):
+            admin()
+        reason = payload.get('reason', '')
+        if not isinstance(reason, str) or len(reason) > 1000:
+            abort(400, 'Причина: не больше 1000 символов')
+        with db() as q:
+            row = q('SELECT revision,data FROM workspace WHERE id=1').fetchone()
+            if row['revision'] != revision:
+                abort(409, 'База изменилась. Обнови данные и повтори действие')
+            data = json.loads(row['data'])
+            partner = next((p for p in data['partners'] if p['id'] == pid), None)
+            if not partner:
+                abort(404, 'Контрагент не найден')
+            if action == 'mark':
+                if partner.get('deletionRequested'):
+                    abort(409, 'Пометка уже поставлена. Обнови данные')
+                partner.update(deletionRequested=True, deletionBy=g.user['name'],
+                               deletionReason=reason.strip(), deletionAt=str(int(time.time())))
+                event = 'Пометка контрагента на удаление'
+            elif action == 'cancel':
+                for key in ('deletionRequested', 'deletionBy', 'deletionReason', 'deletionAt'):
+                    partner.pop(key, None)
+                event = 'Отмена пометки на удаление'
+            else:
+                data['partners'] = [p for p in data['partners'] if p['id'] != pid]
+                # Preserve history and reminders, removing the reference to a deleted card.
+                for collection in ('notes', 'calls'):
+                    for item in data[collection]:
+                        if item.get('partner') == pid:
+                            item['partner'] = ''
+                            if collection == 'notes':
+                                item['text'] = f"Контрагент: {partner['name']} (удалён)\n" + item['text']
+                event = 'Удаление контрагента'
+            validate_state(data)
+            result = q('UPDATE workspace SET data=?,revision=revision+1 WHERE id=1 AND revision=?',
+                       (json.dumps(data, ensure_ascii=False, allow_nan=False), revision))
+            if not result.rowcount:
+                abort(409, 'База изменилась. Обнови данные и повтори действие')
+            audit(q, g.user['login'], event, partner['name'] + ('; ' + reason.strip() if action == 'mark' and reason.strip() else ''))
+        return jsonify(revision=revision+1)
 
     @app.post('/api/import/excel')
     def import_excel():
