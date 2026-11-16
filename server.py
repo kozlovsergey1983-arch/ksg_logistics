@@ -13,6 +13,8 @@ from pathlib import Path
 
 from excel_import import read_contacts, merge_contacts
 
+from documents import DOCUMENT_SCHEMA, register_documents
+
 from flask import Flask, abort, g, jsonify, request, send_from_directory, session
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -25,7 +27,7 @@ SCHEMA = [
     'CREATE TABLE IF NOT EXISTS workspace (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL, data TEXT NOT NULL)',
     'CREATE TABLE IF NOT EXISTS audit (id TEXT PRIMARY KEY, created BIGINT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT NOT NULL)',
     'CREATE TABLE IF NOT EXISTS attempts (login TEXT PRIMARY KEY, count INTEGER NOT NULL, reset BIGINT NOT NULL)',
-]
+] + DOCUMENT_SCHEMA
 
 
 def create_app(config=None):
@@ -129,7 +131,7 @@ def create_app(config=None):
                 abort(403, 'Обнови страницу и повтори действие (CSRF)')
             if request.headers.get('Sec-Fetch-Site') == 'cross-site':
                 abort(403)
-        if request.method not in ('GET', 'HEAD', 'OPTIONS') and request.path != '/api/import/excel' and not isinstance(request.get_json(silent=True), dict):
+        if request.method not in ('GET', 'HEAD', 'OPTIONS') and request.path not in ('/api/import/excel', '/api/documents') and not isinstance(request.get_json(silent=True), dict):
             abort(400, 'Ожидается JSON-объект')
         if request.path in ('/api/login', '/api/session'):
             return
@@ -171,7 +173,7 @@ def create_app(config=None):
 
     @app.get('/<filename>')
     def assets(filename):
-        if filename not in ('app.js', 'style.css', 'auth.js'):
+        if filename not in ('app.js', 'style.css', 'auth.js', 'documents.js'):
             abort(404)
         return send_from_directory(ROOT / 'public', filename)
 
@@ -391,6 +393,8 @@ def create_app(config=None):
                 audit(q, g.user['login'], 'Импорт Excel',
                       f"Добавлено: {result['added']}; пропущено: {result['skipped']}")
         return jsonify(**result, revision=revision)
+
+    register_documents(app, db, audit, admin)
 
     @app.get('/api/users')
     def users():
