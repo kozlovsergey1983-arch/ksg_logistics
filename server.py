@@ -25,6 +25,7 @@ ROOT = Path(__file__).parent
 COLLECTIONS = ('items', 'partners', 'deals', 'calls', 'notes', 'templates')
 SCHEMA = [
     'CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, login TEXT UNIQUE NOT NULL, name TEXT NOT NULL, password TEXT NOT NULL, role TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, must_change INTEGER NOT NULL DEFAULT 1)',
+    'CREATE TABLE IF NOT EXISTS deleted_users (user_id TEXT PRIMARY KEY REFERENCES users(id))',
     'CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), expires BIGINT NOT NULL)',
     'CREATE TABLE IF NOT EXISTS workspace (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL, data TEXT NOT NULL)',
     'CREATE TABLE IF NOT EXISTS audit (id TEXT PRIMARY KEY, created BIGINT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT NOT NULL)',
@@ -424,7 +425,7 @@ def create_app(config=None):
     def users():
         admin()
         with db() as q:
-            rows = q('SELECT * FROM users ORDER BY login').fetchall()
+            rows = q('SELECT * FROM users WHERE id NOT IN (SELECT user_id FROM deleted_users) ORDER BY login').fetchall()
         return jsonify(users=[public_user(u) for u in rows])
 
     @app.post('/api/users')
@@ -450,7 +451,8 @@ def create_app(config=None):
         admin()
         data = request.get_json() or {}
         with db() as q:
-            target = q('SELECT * FROM users WHERE id=?',(uid,)).fetchone()
+            q('UPDATE users SET active=active WHERE id=?', (g.user['id'],))
+            target = q('SELECT * FROM users WHERE id=? AND id NOT IN (SELECT user_id FROM deleted_users)',(uid,)).fetchone()
             if not target:
                 abort(404)
             if target['role']=='owner' or target['id']==g.user['id']:
@@ -463,14 +465,39 @@ def create_app(config=None):
             active = data.get('active',bool(target['active']))
             if type(active) is not bool:
                 abort(400)
+            login = valid_login(data.get('login', target['login']))
+            display = name(data.get('name', target['name']))
+            if q('SELECT id FROM users WHERE login=? AND id<>?', (login, uid)).fetchone():
+                abort(409, 'Логин уже занят')
             password = target['password']
             must_change = target['must_change']
             if data.get('password'):
                 password = generate_password_hash(strong_password(data['password']))
                 must_change = 1
-            q('UPDATE users SET role=?,active=?,password=?,must_change=? WHERE id=?',(role,int(active),password,must_change,uid))
+            q('UPDATE users SET login=?,name=?,role=?,active=?,password=?,must_change=? WHERE id=?',
+              (login,display,role,int(active),password,must_change,uid))
             q('DELETE FROM sessions WHERE user_id=?',(uid,))
-            audit(q,g.user['login'],'Изменение доступа',target['login'])
+            audit(q,g.user['login'],'Изменение пользователя',target['login'] + ' → ' + login)
+        return jsonify(ok=True)
+
+    @app.delete('/api/users/<uid>')
+    def delete_user(uid):
+        admin()
+        with db() as q:
+            q('UPDATE users SET active=active WHERE id=?', (g.user['id'],))
+            target = q('SELECT * FROM users WHERE id=? AND id NOT IN (SELECT user_id FROM deleted_users)', (uid,)).fetchone()
+            if not target:
+                abort(404)
+            if target['role'] == 'owner' or target['id'] == g.user['id']:
+                abort(403, 'Нельзя удалить главного администратора или свой аккаунт')
+            if g.user['role'] != 'owner' and target['role'] != 'member':
+                abort(403)
+            q('DELETE FROM sessions WHERE user_id=?', (uid,))
+            # Keep the identity referenced by uploaded documents and historical records.
+            q('UPDATE users SET login=?,password=?,active=0 WHERE id=?',
+              ('deleted-' + uid, generate_password_hash(secrets.token_urlsafe(32)), uid))
+            q('INSERT INTO deleted_users VALUES (?)', (uid,))
+            audit(q, g.user['login'], 'Удаление пользователя', target['login'])
         return jsonify(ok=True)
 
     @app.get('/api/audit')
