@@ -15,7 +15,7 @@ from excel_import import read_contacts, merge_contacts
 
 from documents import DOCUMENT_SCHEMA, register_documents
 
-from route_service import ROUTE_SCHEMA, register_routes
+from route_service import ROUTE_SCHEMA, register_routes, validate_item_locations
 
 from flask import Flask, abort, g, jsonify, request, send_from_directory, session
 from werkzeug.exceptions import HTTPException
@@ -286,6 +286,11 @@ def create_app(config=None):
                 if key == 'deals' and row.get('status') not in ('Новая','Поиск машины','Согласование','В пути','Документы','Закрыта'): abort(400)
                 if key == 'items' and (row.get('kind') not in ('cargo','truck') or not row.get('from') or not row.get('to')): abort(400)
                 if key == 'calls' and type(row.get('done',False)) is not bool: abort(400)
+                if key == 'items':
+                    try:
+                        validate_item_locations(app, row)
+                    except ValueError as exc:
+                        abort(400, str(exc))
 
     @app.put('/api/state')
     def update_state():
