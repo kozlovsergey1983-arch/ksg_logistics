@@ -265,14 +265,14 @@ def create_app(config=None):
                 for field in text_fields:
                     if not isinstance(row.get(field,''),str): abort(400, 'Текстовое поле имеет неверный формат')
                     row.setdefault(field, '')
-                numeric_fields = {'items': ['weight','rate'], 'deals': ['client','carrier']}.get(key, [])
+                numeric_fields = {'items': ['weight','rate','volume'], 'deals': ['client','carrier']}.get(key, [])
                 for field in numeric_fields:
                     try:
                         number = float(row.get(field) or 0)
                     except (ValueError, TypeError):
-                        abort(400, 'Ставка и вес должны быть числами')
+                        abort(400, 'Ставка, вес и объём должны быть числами')
                     if not math.isfinite(number) or number < 0:
-                        abort(400, 'Ставка и вес должны быть неотрицательными числами')
+                        abort(400, 'Ставка, вес и объём должны быть неотрицательными числами')
                 if key == 'notes' and not row.get('text'):
                     abort(400, 'Заметка не может быть пустой')
                 if key in ('items','partners','deals','calls','templates') and not row.get('name'): abort(400, 'Запись без названия')
