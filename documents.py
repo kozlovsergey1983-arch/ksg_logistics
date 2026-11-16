@@ -15,6 +15,34 @@ DOCUMENT_SCHEMA = [
 ]
 
 
+def preview_type(filename):
+    suffix = filename.rsplit('.', 1)[-1].lower()
+    return {'pdf': 'pdf', 'png': 'image', 'jpg': 'image', 'jpeg': 'image',
+            'gif': 'image', 'webp': 'image', 'txt': 'text'}.get(suffix, '')
+
+
+def preview_mimetype(filename, content):
+    kind = preview_type(filename)
+    if kind == 'pdf' and content.lstrip().startswith(b'%PDF-'):
+        return 'application/pdf'
+    if kind == 'image':
+        if content.startswith(b'\x89PNG\r\n\x1a\n'):
+            return 'image/png'
+        if content.startswith(b'\xff\xd8\xff'):
+            return 'image/jpeg'
+        if content.startswith((b'GIF87a', b'GIF89a')):
+            return 'image/gif'
+        if content.startswith(b'RIFF') and content[8:12] == b'WEBP':
+            return 'image/webp'
+    if kind == 'text':
+        try:
+            content.decode('utf-8-sig')
+        except UnicodeDecodeError:
+            return ''
+        return 'text/plain'
+    return ''
+
+
 def register_documents(app, db, audit, admin):
     def is_admin():
         return g.user['role'] in ('owner', 'admin')
@@ -40,7 +68,7 @@ def register_documents(app, db, audit, admin):
                      'WHERE s.id=1 ORDER BY d.position,d.uploaded,d.id',
                      (int(is_admin()), g.user['id'])).fetchall()
         return jsonify(revision=rows[0]['revision'], documents=[
-            {k: row[k] for k in ('id', 'name', 'size', 'status', 'position', 'uploader_name', 'uploaded', 'reason')}
+            dict({k: row[k] for k in ('id', 'name', 'size', 'status', 'position', 'uploader_name', 'uploaded', 'reason')}, preview_type=preview_type(row['name']))
             for row in rows if row['id'] is not None])
 
     @app.post('/api/documents')
@@ -77,6 +105,19 @@ def register_documents(app, db, audit, admin):
             abort(404, 'Документ не найден')
         return send_file(BytesIO(base64.b64decode(doc['content'])), mimetype='application/octet-stream',
                          as_attachment=True, download_name=doc['name'])
+
+    @app.get('/api/documents/<did>/preview')
+    def documents_preview(did):
+        with db() as q:
+            doc = q('SELECT * FROM documents WHERE id=?', (did,)).fetchone()
+        if not doc or (doc['status'] != 'approved' and not is_admin() and doc['uploader_id'] != g.user['id']):
+            abort(404, 'Документ не найден')
+        content = base64.b64decode(doc['content'])
+        mimetype = preview_mimetype(doc['name'], content)
+        if not mimetype:
+            abort(415, 'Предпросмотр этого формата недоступен. Используй скачивание')
+        return send_file(BytesIO(content), mimetype=mimetype, as_attachment=False,
+                         download_name=doc['name'])
 
     @app.post('/api/documents/<did>/moderate')
     def documents_moderate(did):
