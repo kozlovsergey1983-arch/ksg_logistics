@@ -94,6 +94,41 @@ class CRMTest(unittest.TestCase):
         owner=next(u for u in c.get('/api/users').json['users'] if u['role']=='owner')
         self.assertEqual(self.post(c,'/api/users/'+owner['id'],dict(active=False),method='PATCH').status_code,403)
         self.assertEqual(self.post(c,'/api/users',dict(login='newadmin',name='Another',password='newadmin-test-password',role='admin')).status_code,403)
+    def test_admin_edits_and_deletes_member(self):
+        worker = self.member()
+        self.post(self.owner, '/api/users', dict(login='manager', name='Manager', password='manager-initial-password', role='admin'))
+        manager = self.app.test_client()
+        self.login(manager, 'manager', 'manager-initial-password')
+        self.post(manager, '/api/password', dict(old='manager-initial-password', password='manager-changed-password'))
+        self.login(manager, 'manager', 'manager-changed-password')
+        users = manager.get('/api/users').json['users']
+        uid = next(u['id'] for u in users if u['login'] == 'worker')
+        path = '/api/users/' + uid
+        self.assertEqual(self.post(manager, path, dict(login='admin'), method='PATCH').status_code, 409)
+        self.assertEqual(self.post(manager, path, dict(name=''), method='PATCH').status_code, 400)
+        self.assertEqual(self.post(manager, path, dict(name='Новое имя', login='newworker'), method='PATCH').status_code, 200)
+        self.assertIsNone(worker.get('/api/session').json['user'])
+        edited = next(u for u in manager.get('/api/users').json['users'] if u['id'] == uid)
+        self.assertEqual((edited['name'], edited['login']), ('Новое имя', 'newworker'))
+        self.login(worker, 'newworker', 'worker-initial-test-password')
+        with self.app.crm_db() as q:
+            q('INSERT INTO documents VALUES (?,?,?,?,?,?,?,?,?,?)',
+              ('doc-user', 'test.txt', 1, 'YQ==', 'pending', 0, uid, 'Логист', 1, ''))
+        state = self.owner.get('/api/state').json
+        for u in users:
+            if u['role'] != 'member':
+                self.assertEqual(self.post(manager, '/api/users/' + u['id'], {}, method='DELETE').status_code, 403)
+        self.assertEqual(self.post(manager, path, {}, method='DELETE').status_code, 200)
+        self.assertIsNone(worker.get('/api/session').json['user'])
+        self.assertNotIn(uid, [u['id'] for u in manager.get('/api/users').json['users']])
+        self.assertEqual(self.post(manager, path, {}, method='DELETE').status_code, 404)
+        self.assertEqual(self.post(manager, path, dict(active=True), method='PATCH').status_code, 404)
+        self.assertEqual(self.post(worker, '/api/login', dict(login='newworker', password='worker-initial-test-password')).status_code, 401)
+        self.assertEqual(self.owner.get('/api/state').json, state)
+        with self.app.crm_db() as q:
+            self.assertEqual(q('SELECT uploader_id FROM documents WHERE id=?', ('doc-user',)).fetchone()['uploader_id'], uid)
+        self.assertEqual(self.post(manager, '/api/users', dict(name='Replacement', login='newworker', password='replacement-password')).status_code, 201)
+
     def test_health_and_hashed_passwords(self):
         self.assertEqual(self.owner.get('/healthz').status_code,200)
         with self.app.crm_db() as q:
