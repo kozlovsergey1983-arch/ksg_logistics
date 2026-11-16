@@ -11,6 +11,8 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
+from excel_import import read_contacts, merge_contacts
+
 from flask import Flask, abort, g, jsonify, request, send_from_directory, session
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -127,7 +129,7 @@ def create_app(config=None):
                 abort(403, 'Обнови страницу и повтори действие (CSRF)')
             if request.headers.get('Sec-Fetch-Site') == 'cross-site':
                 abort(403)
-        if request.method not in ('GET', 'HEAD', 'OPTIONS') and not isinstance(request.get_json(silent=True), dict):
+        if request.method not in ('GET', 'HEAD', 'OPTIONS') and request.path != '/api/import/excel' and not isinstance(request.get_json(silent=True), dict):
             abort(400, 'Ожидается JSON-объект')
         if request.path in ('/api/login', '/api/session'):
             return
@@ -296,6 +298,40 @@ def create_app(config=None):
     def admin():
         if g.user['role'] not in ('owner','admin'):
             abort(403, 'Доступно только администратору')
+
+    @app.post('/api/import/excel')
+    def import_excel():
+        admin()
+        upload = request.files.get('file')
+        if not upload or not upload.filename.lower().endswith('.xlsx'):
+            abort(400, 'Выбери файл Excel в формате .xlsx (до 5 МБ)')
+        mode = request.form.get('mode', 'preview')
+        if mode not in ('preview', 'commit'):
+            abort(400, 'Неизвестный режим импорта')
+        try:
+            rows = read_contacts(upload.stream)
+        except Exception as exc:
+            abort(400, str(exc) if isinstance(exc, ValueError) else 'Не удалось прочитать Excel-файл')
+        with db() as q:
+            row = q('SELECT revision,data FROM workspace WHERE id=1').fetchone()
+            if mode == 'commit' and request.form.get('revision') != str(row['revision']):
+                abort(409, 'База изменилась. Повтори предварительный просмотр импорта')
+            data = json.loads(row['data'])
+            try:
+                result = merge_contacts(data, rows)
+            except ValueError as exc:
+                abort(400, str(exc))
+            validate_state(data)
+            revision = row['revision']
+            if mode == 'commit' and result['added']:
+                updated = q('UPDATE workspace SET data=?,revision=revision+1 WHERE id=1 AND revision=?',
+                            (json.dumps(data, ensure_ascii=False, allow_nan=False), revision))
+                if not updated.rowcount:
+                    abort(409, 'База изменилась. Повтори предварительный просмотр импорта')
+                revision += 1
+                audit(q, g.user['login'], 'Импорт Excel',
+                      f"Добавлено: {result['added']}; пропущено: {result['skipped']}")
+        return jsonify(**result, revision=revision)
 
     @app.get('/api/users')
     def users():

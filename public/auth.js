@@ -27,3 +27,25 @@ function userForm(id){const u=usersCache.find(x=>x.id===id);const roleOptions=cu
 }
 setInterval(async()=>{if(!currentUser||currentUser.must_change||busy||$('#modal').open||page==='Пользователи'||['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName))return;try{const old=revision;await loadState();if(old!==revision)render()}catch{ /* Keep current data; saving will report connection failures. */ }},30000);
 boot();
+
+
+function excelImportForm(){
+ show(`<h2>Импорт контрагентов из Excel</h2><p>Файл .xlsx до 5 МБ. Первая строка — заголовки, обязательный столбец «Компания» или «Название». Существующие записи сохраняются. Совпадения по ИНН, а без ИНН — по названию, пропускаются.</p><form id="excelForm"><label>Excel-файл<input name="file" type="file" accept=".xlsx" required></label><p id="excelError" role="alert"></p><div id="excelPreview"></div><div class="actions"><button type="button" onclick="closeModal()">Закрыть</button><button class="primary" id="excelSubmit">Проверить файл</button></div></form>`);
+ const f=$('#excelForm');let checked=null,checkedFile=null;
+ f.file.onchange=()=>{checked=null;checkedFile=null;$('#excelPreview').textContent='';$('#excelSubmit').textContent='Проверить файл'};
+ f.onsubmit=async event=>{
+  event.preventDefault();if(busy)return toast('Дождись завершения сохранения');
+  const file=f.file.files[0];if(!file)return;
+  if(file.size>5*1024*1024){$('#excelError').textContent='Файл должен быть не больше 5 МБ';return}
+  const commit=checked!==null&&checkedFile===file;
+  const body=new FormData();body.append('file',file);body.append('mode',commit?'commit':'preview');if(commit)body.append('revision',checked.revision);
+  busy=true;$('#excelSubmit').disabled=true;f.file.disabled=true;$('#excelError').textContent='';
+  try{
+   const response=await fetch('/api/import/excel',{method:'POST',credentials:'same-origin',headers:{'X-CSRF-Token':csrf},body});
+   const r=await response.json();if(!response.ok)throw Error(r.error||'Ошибка импорта');
+   if(commit){closeModal();await loadState();page='Контрагенты';render();toast(`Добавлено: ${r.added}. Пропущено: ${r.skipped}`)}
+   else{checked=r;checkedFile=file;$('#excelPreview').innerHTML=`<p>Всего: ${r.total}. Будет добавлено: ${r.added}. Совпадений: ${r.skipped}.</p><p>Первые ${r.preview.length} новых компаний:</p>${r.preview.map(p=>`<p><b>${esc(p.name)}</b> · ${esc(p.inn)} · ${esc(p.phone)}</p>`).join('')}<p>Дополнительные сведения из всех столбцов сохранятся в истории компании.</p>`;$('#excelSubmit').textContent=r.added?'Добавить в общую базу':'Новых компаний нет';$('#excelSubmit').disabled=!r.added}
+  }catch(e){checked=null;checkedFile=null;$('#excelError').textContent=e.message;$('#excelSubmit').textContent='Проверить файл'}
+  finally{busy=false;f.file.disabled=false;if($('#excelSubmit'))$('#excelSubmit').disabled=checked!==null&&!checked.added}
+ };
+}
