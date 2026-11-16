@@ -15,6 +15,8 @@ from excel_import import read_contacts, merge_contacts
 
 from documents import DOCUMENT_SCHEMA, register_documents
 
+from route_service import ROUTE_SCHEMA, register_routes
+
 from flask import Flask, abort, g, jsonify, request, send_from_directory, session
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -27,7 +29,7 @@ SCHEMA = [
     'CREATE TABLE IF NOT EXISTS workspace (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL, data TEXT NOT NULL)',
     'CREATE TABLE IF NOT EXISTS audit (id TEXT PRIMARY KEY, created BIGINT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT NOT NULL)',
     'CREATE TABLE IF NOT EXISTS attempts (login TEXT PRIMARY KEY, count INTEGER NOT NULL, reset BIGINT NOT NULL)',
-] + DOCUMENT_SCHEMA
+] + DOCUMENT_SCHEMA + ROUTE_SCHEMA
 
 
 def create_app(config=None):
@@ -156,7 +158,7 @@ def create_app(config=None):
         response.headers['X-Content-Type-Options'] = 'nosniff'
         response.headers['X-Frame-Options'] = 'DENY'
         response.headers['Referrer-Policy'] = 'same-origin'
-        response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-src 'self' https://yandex.ru; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
         if request.endpoint == 'documents_preview' and response.status_code == 200:
             response.headers['X-Frame-Options'] = 'SAMEORIGIN'
             response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'none'; object-src 'self'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'"
@@ -176,7 +178,7 @@ def create_app(config=None):
 
     @app.get('/<filename>')
     def assets(filename):
-        if filename not in ('app.js', 'style.css', 'auth.js', 'documents.js'):
+        if filename not in ('app.js', 'style.css', 'auth.js', 'documents.js', 'routes.js'):
             abort(404)
         return send_from_directory(ROOT / 'public', filename)
 
@@ -270,14 +272,14 @@ def create_app(config=None):
                 for field in text_fields:
                     if not isinstance(row.get(field,''),str): abort(400, 'Текстовое поле имеет неверный формат')
                     row.setdefault(field, '')
-                numeric_fields = {'items': ['weight','rate','volume'], 'deals': ['client','carrier']}.get(key, [])
+                numeric_fields = {'items': ['weight','rate','volume','distanceKm'], 'deals': ['client','carrier']}.get(key, [])
                 for field in numeric_fields:
                     try:
                         number = float(row.get(field) or 0)
                     except (ValueError, TypeError):
-                        abort(400, 'Ставка, вес и объём должны быть числами')
+                        abort(400, 'Ставка, вес, объём и расстояние должны быть числами')
                     if not math.isfinite(number) or number < 0:
-                        abort(400, 'Ставка, вес и объём должны быть неотрицательными числами')
+                        abort(400, 'Ставка, вес, объём и расстояние должны быть неотрицательными числами')
                 if key == 'notes' and not row.get('text'):
                     abort(400, 'Заметка не может быть пустой')
                 if key in ('items','partners','deals','calls','templates') and not row.get('name'): abort(400, 'Запись без названия')
@@ -296,7 +298,20 @@ def create_app(config=None):
             previous = q('SELECT revision,data FROM workspace WHERE id=1').fetchone()
             if previous['revision'] != revision:
                 abort(409, 'База изменена другим сотрудником. Обнови данные и повтори изменение')
-            old_partners = {p['id']: p for p in json.loads(previous['data'])['partners']}
+            previous_data = json.loads(previous['data'])
+            old_items = {item['id']: item for item in previous_data['items']}
+            for item in data['items']:
+                old = old_items.get(item['id'])
+                if old is None:
+                    item.update(createdBy=g.user['name'], createdById=g.user['id'],
+                                createdByLogin=g.user['login'], createdAt=int(time.time()))
+                else:
+                    for field in ('createdBy', 'createdById', 'createdByLogin', 'createdAt'):
+                        if field in old:
+                            item[field] = old[field]
+                        else:
+                            item.pop(field, None)
+            old_partners = {p['id']: p for p in previous_data['partners']}
             new_partners = {p['id']: p for p in data['partners']}
             if g.user['role'] == 'member' and old_partners.keys() - new_partners.keys():
                 abort(403, 'Удалять контрагентов может только администратор. Поставь пометку на удаление')
@@ -310,7 +325,7 @@ def create_app(config=None):
             if not result.rowcount:
                 abort(409, 'База изменена другим сотрудником. Обнови данные и повтори изменение')
             audit(q, g.user['login'], 'Изменение базы', str(revision+1))
-        return jsonify(revision=revision+1)
+        return jsonify(revision=revision+1, data=data)
 
     def admin():
         if g.user['role'] not in ('owner','admin'):
@@ -397,6 +412,7 @@ def create_app(config=None):
                       f"Добавлено: {result['added']}; пропущено: {result['skipped']}")
         return jsonify(**result, revision=revision)
 
+    register_routes(app, db)
     register_documents(app, db, audit, admin)
 
     @app.get('/api/users')
