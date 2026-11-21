@@ -8,6 +8,8 @@ import secrets
 import sqlite3
 import time
 import uuid
+import urllib.request
+import urllib.error
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -507,9 +509,55 @@ def create_app(config=None):
             rows=q('SELECT * FROM audit ORDER BY created DESC LIMIT 200').fetchall()
         return jsonify(events=[dict(r) for r in rows])
 
+    @app.post('/api/company-lookup')
+    def company_lookup():
+        query = (request.get_json() or {}).get('query', '')
+        if not isinstance(query, str) or not 3 <= len(query.strip()) <= 300:
+            abort(400, 'Введи название или ИНН (3–300 символов)')
+        query = query.strip()
+        if query.isdigit() and len(query) not in (10, 12):
+            abort(400, 'Для поиска по ИНН укажи 10 или 12 цифр')
+        token = os.getenv('DADATA_API_KEY', '').strip()
+        if not token:
+            abort(503, 'Поиск реквизитов ещё не подключён. Используй «Открыть интернет-поиск».')
+        last = session.get('company_lookup_at', 0)
+        if time.time() - last < 1:
+            abort(429, 'Повтори поиск через секунду')
+        session['company_lookup_at'] = time.time()
+        method = 'findById' if query.isdigit() else 'suggest'
+        payload = json.dumps({'query': query, 'count': 10}).encode('utf-8')
+        req = urllib.request.Request('https://suggestions.dadata.ru/suggestions/api/4_1/rs/' + method + '/party', data=payload,
+                                     headers={'Authorization': 'Token ' + token, 'Content-Type': 'application/json', 'Accept': 'application/json'})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as response:
+                raw = response.read(2 * 1024 * 1024 + 1)
+            if len(raw) > 2 * 1024 * 1024:
+                raise ValueError('large response')
+            suggestions = json.loads(raw).get('suggestions', [])
+            if not isinstance(suggestions, list):
+                raise ValueError('invalid response')
+            companies = []
+            for item in suggestions[:10]:
+                data = item.get('data') or {}
+                name_data = data.get('name') or {}
+                address = data.get('address') or {}
+                company = {'name': name_data.get('short_with_opf') or item.get('value') or '',
+                           'inn': data.get('inn') or '', 'kpp': data.get('kpp') or '',
+                           'ogrn': data.get('ogrn') or '', 'address': address.get('value') or ''}
+                if all(isinstance(v, str) for v in company.values()) and company['name'] and company['inn']:
+                    companies.append(company)
+            return jsonify(companies=companies)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                abort(503, 'Сервис реквизитов отклонил ключ или исчерпан лимит. Используй интернет-поиск.')
+            abort(502, 'Сервис реквизитов временно недоступен. Повтори позже.')
+        except (OSError, ValueError, TypeError, AttributeError):
+            abort(502, 'Не удалось получить реквизиты. Используй интернет-поиск.')
+
     return app
 
 DUMMY_HASH = generate_password_hash(secrets.token_urlsafe(32))
 
 if __name__ == '__main__':
     create_app().run(host='0.0.0.0', port=int(os.getenv('PORT','8080')))
+
