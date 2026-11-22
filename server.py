@@ -343,12 +343,12 @@ def create_app(config=None):
     def call_deletion(cid):
         payload = request.get_json()
         action, expected = payload.get('action'), payload.get('revision')
-        if action not in ('mark', 'delete') or type(expected) is not int:
+        if action not in ('mark', 'cancel', 'delete') or type(expected) is not int:
             abort(400, 'Неверный запрос')
         reason = payload.get('reason', '')
         if not isinstance(reason, str) or len(reason) > 1000:
             abort(400, 'Причина: не больше 1000 символов')
-        if action == 'delete':
+        if action in ('cancel', 'delete'):
             admin()
         with db() as q:
             row = q('SELECT revision,data FROM workspace WHERE id=1').fetchone()
@@ -364,6 +364,10 @@ def create_app(config=None):
                 call.update(deletionRequested=True, deletionBy=g.user['name'],
                             deletionReason=reason.strip(), deletionAt=str(int(time.time())))
                 event = 'Запрос на удаление задачи'
+            elif action == 'cancel':
+                for key in ('deletionRequested', 'deletionBy', 'deletionReason', 'deletionAt'):
+                    call.pop(key, None)
+                event = 'Отмена пометки на удаление задачи'
             else:
                 data['calls'] = [c for c in data['calls'] if c['id'] != cid]
                 event = 'Удаление задачи'
