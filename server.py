@@ -339,6 +339,42 @@ def create_app(config=None):
         if g.user['role'] not in ('owner','admin'):
             abort(403, 'Доступно только администратору')
 
+    @app.post('/api/calls/<cid>/deletion')
+    def call_deletion(cid):
+        payload = request.get_json()
+        action, expected = payload.get('action'), payload.get('revision')
+        if action not in ('mark', 'delete') or type(expected) is not int:
+            abort(400, 'Неверный запрос')
+        reason = payload.get('reason', '')
+        if not isinstance(reason, str) or len(reason) > 1000:
+            abort(400, 'Причина: не больше 1000 символов')
+        if action == 'delete':
+            admin()
+        with db() as q:
+            row = q('SELECT revision,data FROM workspace WHERE id=1').fetchone()
+            if row['revision'] != expected:
+                abort(409, 'База изменилась. Обнови данные и повтори действие')
+            data = json.loads(row['data'])
+            call = next((c for c in data['calls'] if c['id'] == cid), None)
+            if not call:
+                abort(404, 'Задача не найдена')
+            if action == 'mark':
+                if call.get('deletionRequested'):
+                    abort(409, 'Запрос уже отправлен')
+                call.update(deletionRequested=True, deletionBy=g.user['name'],
+                            deletionReason=reason.strip(), deletionAt=str(int(time.time())))
+                event = 'Запрос на удаление задачи'
+            else:
+                data['calls'] = [c for c in data['calls'] if c['id'] != cid]
+                event = 'Удаление задачи'
+            validate_state(data)
+            updated = q('UPDATE workspace SET data=?,revision=revision+1 WHERE id=1 AND revision=?',
+                        (json.dumps(data, ensure_ascii=False, allow_nan=False), expected))
+            if not updated.rowcount:
+                abort(409, 'База изменилась. Обнови данные и повтори действие')
+            audit(q, g.user['login'], event, call['name'] + ('; '+reason.strip() if action == 'mark' and reason.strip() else ''))
+        return jsonify(revision=expected+1)
+
     @app.post('/api/partners/<pid>/deletion')
     def partner_deletion(pid):
         payload = request.get_json()
