@@ -170,17 +170,18 @@ def create_app(config=None):
             response.headers['Strict-Transport-Security'] = 'max-age=31536000'
         return response
 
-    @app.get('/downloads/<filename>')
+        @app.get('/downloads/<filename>')
     def download_apk(filename):
-        if filename != 'KSG-Logistics-0.3.5-beta.apk':
+        if filename not in ('KSG-Logistics-latest.apk', 'KSG-Logistics-0.3.5-beta.apk'):
             abort(404)
+        artifact = 'KSG-Logistics-0.3.6-beta.apk'
         try:
-            encoded = (ROOT / 'downloads' / (filename + '.b64')).read_text(encoding='ascii')
+            encoded = (ROOT / 'downloads' / (artifact + '.b64')).read_text(encoding='ascii')
             package = base64.b64decode(encoded, validate=True)
         except (OSError, ValueError):
             abort(503, 'Обновление пока недоступно')
         response = Response(package, mimetype='application/vnd.android.package-archive')
-        response.headers['Content-Disposition'] = f'attachment; filename="{filename}"'
+        response.headers['Content-Disposition'] = f'attachment; filename="{artifact}"'
         response.headers['Cache-Control'] = 'public, max-age=300'
         return response
 
