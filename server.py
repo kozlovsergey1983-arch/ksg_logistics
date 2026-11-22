@@ -1,4 +1,5 @@
 """KSG CRM: authenticated shared workspace. PostgreSQL in production."""
+import base64
 import hashlib
 import json
 import math
@@ -19,7 +20,7 @@ from documents import DOCUMENT_SCHEMA, register_documents
 
 from route_service import ROUTE_SCHEMA, register_routes, validate_item_locations
 
-from flask import Flask, abort, g, jsonify, request, send_from_directory, session
+from flask import Flask, Response, abort, g, jsonify, request, send_from_directory, session
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -167,6 +168,20 @@ def create_app(config=None):
             response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'none'; object-src 'self'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'"
         if app.config['APP_ENV'] == 'production':
             response.headers['Strict-Transport-Security'] = 'max-age=31536000'
+        return response
+
+    @app.get('/downloads/<filename>')
+    def download_apk(filename):
+        if filename != 'KSG-Logistics-0.3.5-beta.apk':
+            abort(404)
+        try:
+            encoded = (ROOT / 'downloads' / (filename + '.b64')).read_text(encoding='ascii')
+            package = base64.b64decode(encoded, validate=True)
+        except (OSError, ValueError):
+            abort(503, 'Обновление пока недоступно')
+        response = Response(package, mimetype='application/vnd.android.package-archive')
+        response.headers['Content-Disposition'] = f'attachment; filename="{filename}"'
+        response.headers['Cache-Control'] = 'public, max-age=300'
         return response
 
     @app.get('/healthz')
