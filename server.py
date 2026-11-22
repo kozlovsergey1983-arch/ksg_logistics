@@ -170,7 +170,7 @@ def create_app(config=None):
             response.headers['Strict-Transport-Security'] = 'max-age=31536000'
         return response
 
-        @app.get('/downloads/<filename>')
+    @app.get('/downloads/<filename>')
     def download_apk(filename):
         if filename not in ('KSG-Logistics-latest.apk', 'KSG-Logistics-0.3.5-beta.apk'):
             abort(404)
