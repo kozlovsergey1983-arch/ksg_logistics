@@ -174,7 +174,7 @@ def create_app(config=None):
     def download_apk(filename):
         if filename not in ('KSG-Logistics-latest.apk', 'KSG-Logistics-0.3.5-beta.apk'):
             abort(404)
-        artifact = 'KSG-Logistics-0.3.6-beta.apk'
+        artifact = 'KSG-Logistics-0.3.7-beta.apk'
         try:
             encoded = (ROOT / 'downloads' / (artifact + '.b64')).read_text(encoding='ascii')
             package = base64.b64decode(encoded, validate=True)
