@@ -211,7 +211,9 @@ def create_app(config=None):
     @app.post('/api/login')
     def login():
         data = request.get_json() or {}
-        login = valid_login(data.get('login'))
+        raw_login = data.get('login')
+        mobile = isinstance(raw_login, str) and raw_login.startswith('mobile:')
+        login = valid_login(raw_login[7:] if mobile else raw_login)
         password = data.get('password', '')
         if not isinstance(password, str) or len(password) > 256:
             abort(400)
@@ -238,7 +240,8 @@ def create_app(config=None):
             audit(q, u['login'], 'Вход')
         session.clear()
         session.update(token=token, csrf=secrets.token_urlsafe(32))
-        return jsonify(user=public_user(u), csrf=session['csrf'])
+        session['mobile_member'] = mobile and u['role'] == 'member'
+        return jsonify(user=public_user(u), csrf=session['csrf'], member_tasks=True)
 
     @app.post('/api/logout')
     def logout():
@@ -267,7 +270,10 @@ def create_app(config=None):
     def state():
         with db() as q:
             row = q('SELECT revision,data FROM workspace WHERE id=1').fetchone()
-        return jsonify(revision=row['revision'], data=json.loads(row['data']))
+        data = json.loads(row['data'])
+        if session.get('mobile_member'):
+            data = {k: [c for c in data['calls'] if c.get('assigneeId') == g.user['id']] if k == 'calls' else [] for k in COLLECTIONS}
+        return jsonify(revision=row['revision'], data=data)
 
     def validate_state(data):
         if not isinstance(data, dict) or set(data) != set(COLLECTIONS):
@@ -315,6 +321,19 @@ def create_app(config=None):
     def update_state():
         payload = request.get_json() or {}
         data, revision = payload.get('data'), payload.get('revision')
+        if session.get('mobile_member'):
+            with db() as q:
+                row = q('SELECT revision,data FROM workspace WHERE id=1').fetchone()
+                if revision != row['revision']:
+                    abort(409, 'Обнови задачи')
+                full = json.loads(row['data'])
+                task = next((c for c in full['calls'] if c['id'] == (data or {}).get('taskId') and c.get('assigneeId') == g.user['id']), None)
+                if task is None or type((data or {}).get('done')) is not bool:
+                    abort(403, 'Можно менять статус только своей задачи')
+                task['done'] = data['done']
+                if not q('UPDATE workspace SET data=?,revision=revision+1 WHERE id=1 AND revision=?', (json.dumps(full, ensure_ascii=False), revision)).rowcount:
+                    abort(409)
+            return jsonify(revision=revision+1)
         validate_state(data)
         if type(revision) is not int:
             abort(400)
@@ -654,4 +673,3 @@ DUMMY_HASH = generate_password_hash(secrets.token_urlsafe(32))
 
 if __name__ == '__main__':
     create_app().run(host='0.0.0.0', port=int(os.getenv('PORT','8080')))
-
