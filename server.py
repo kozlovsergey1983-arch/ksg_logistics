@@ -394,6 +394,44 @@ def create_app(config=None):
             audit(q, g.user['login'], event, call['name'] + ('; '+reason.strip() if action == 'mark' and reason.strip() else ''))
         return jsonify(revision=expected+1)
 
+    @app.post('/api/partners/<pid>/work')
+    def partner_work(pid):
+        payload = request.get_json() or {}
+        action, revision = payload.get('action'), payload.get('revision')
+        if action not in ('take', 'release') or type(revision) is not int:
+            abort(400, 'Неверный запрос')
+        with db() as q:
+            row = q('SELECT revision,data FROM workspace WHERE id=1').fetchone()
+            if row['revision'] != revision:
+                abort(409, 'База изменилась. Обнови данные и повтори действие')
+            data = json.loads(row['data'])
+            partner = next((p for p in data['partners'] if p['id'] == pid), None)
+            if not partner:
+                abort(404, 'Контрагент не найден')
+            if partner.get('deletionRequested'):
+                abort(409, 'Контрагент помечен на удаление')
+            if action == 'take':
+                if partner.get('workById'):
+                    abort(409, f"Контрагент уже в работе у {partner.get('workBy', 'сотрудника')}")
+                partner.update(workById=g.user['id'], workBy=g.user['name'],
+                               workAt=str(int(time.time())))
+                event = 'Взял контрагента в работу'
+            else:
+                if not partner.get('workById'):
+                    abort(409, 'Контрагент уже свободен')
+                if g.user['role'] not in ('owner', 'admin') and partner.get('workById') != g.user['id']:
+                    abort(403, 'Снять контрагента с работы может назначенный сотрудник или администратор')
+                for key in ('workById', 'workBy', 'workAt'):
+                    partner.pop(key, None)
+                event = 'Снял контрагента с работы'
+            validate_state(data)
+            result = q('UPDATE workspace SET data=?,revision=revision+1 WHERE id=1 AND revision=?',
+                       (json.dumps(data, ensure_ascii=False, allow_nan=False), revision))
+            if not result.rowcount:
+                abort(409, 'База изменилась. Обнови данные и повтори действие')
+            audit(q, g.user['login'], event, partner['name'])
+        return jsonify(revision=revision+1, partner=partner)
+
     @app.post('/api/partners/<pid>/deletion')
     def partner_deletion(pid):
         payload = request.get_json()
