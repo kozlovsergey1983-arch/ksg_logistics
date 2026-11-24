@@ -14,6 +14,10 @@ import urllib.error
 from contextlib import contextmanager
 from pathlib import Path
 
+from crm_diadoc import DIADOC_SCHEMA, environment_settings, register_diadoc
+from crm_contracts import CONTRACT_SCHEMA, register_contracts
+from crm_chat import CHAT_SCHEMA, register_chat
+from crm_workspace import in_call_queue, normalize_partners, partner_transitions, repeat_task, task_transitions, validate_partner
 from excel_import import read_contacts, merge_contacts
 
 from documents import DOCUMENT_SCHEMA, register_documents
@@ -27,14 +31,13 @@ from werkzeug.security import check_password_hash, generate_password_hash
 ROOT = Path(__file__).parent
 COLLECTIONS = ('items', 'partners', 'deals', 'calls', 'notes', 'templates')
 SCHEMA = [
-    "CREATE TABLE IF NOT EXISTS chat_messages (id TEXT PRIMARY KEY, sender TEXT NOT NULL, sender_name TEXT NOT NULL, recipient TEXT NOT NULL, body TEXT NOT NULL, created BIGINT NOT NULL)",
     'CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, login TEXT UNIQUE NOT NULL, name TEXT NOT NULL, password TEXT NOT NULL, role TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, must_change INTEGER NOT NULL DEFAULT 1)',
     'CREATE TABLE IF NOT EXISTS deleted_users (user_id TEXT PRIMARY KEY REFERENCES users(id))',
     'CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), expires BIGINT NOT NULL)',
     'CREATE TABLE IF NOT EXISTS workspace (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL, data TEXT NOT NULL)',
     'CREATE TABLE IF NOT EXISTS audit (id TEXT PRIMARY KEY, created BIGINT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT NOT NULL)',
     'CREATE TABLE IF NOT EXISTS attempts (login TEXT PRIMARY KEY, count INTEGER NOT NULL, reset BIGINT NOT NULL)',
-] + DOCUMENT_SCHEMA + ROUTE_SCHEMA
+] + DOCUMENT_SCHEMA + ROUTE_SCHEMA + CHAT_SCHEMA + CONTRACT_SCHEMA + DIADOC_SCHEMA
 
 
 def create_app(config=None):
@@ -44,6 +47,8 @@ def create_app(config=None):
                       ADMIN_LOGIN=os.getenv('ADMIN_LOGIN', 'admin'), ADMIN_NAME=os.getenv('ADMIN_NAME', 'Сергей'),
                       ADMIN_PASSWORD=os.getenv('ADMIN_PASSWORD'), MAX_CONTENT_LENGTH=5 * 1024 * 1024,
                       SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_SECURE=True)
+    app.config['CONTRACT_COMPANY'] = json.loads(os.getenv('CONTRACT_COMPANY_JSON', '{}'))
+    app.config['DIADOC'] = environment_settings()
     if config:
         app.config.update(config)
     if not app.config['SECRET_KEY'] or len(app.config['SECRET_KEY']) < 32:
@@ -138,8 +143,10 @@ def create_app(config=None):
                 abort(403, 'Обнови страницу и повтори действие (CSRF)')
             if request.headers.get('Sec-Fetch-Site') == 'cross-site':
                 abort(403)
-        if request.method not in ('GET', 'HEAD', 'OPTIONS') and request.path not in ('/api/import/excel', '/api/documents') and not isinstance(request.get_json(silent=True), dict):
-            abort(400, 'Ожидается JSON-объект')
+            upload_paths = ('/api/import/excel', '/api/documents', '/api/chat', '/api/contracts/templates')
+            upload = request.path in upload_paths and request.mimetype == 'multipart/form-data'
+            if not upload and not isinstance(request.get_json(silent=True), dict):
+                abort(400, 'Ожидается JSON-объект')
         if request.path in ('/api/login', '/api/session'):
             return
         u = current_user()
@@ -198,7 +205,7 @@ def create_app(config=None):
 
     @app.get('/<filename>')
     def assets(filename):
-        if filename not in ('app.js', 'style.css', 'auth.js', 'documents.js', 'routes.js'):
+        if filename not in ('app.js', 'style.css', 'auth.js', 'documents.js', 'routes.js', 'crm.js', 'contracts.js'):
             abort(404)
         return send_from_directory(ROOT / 'public', filename)
 
@@ -271,9 +278,13 @@ def create_app(config=None):
     def state():
         with db() as q:
             row = q('SELECT revision,data FROM workspace WHERE id=1').fetchone()
-        data = json.loads(row['data'])
+        data = normalize_partners(json.loads(row['data']))
         if session.get('mobile_member'):
-            data = {k: [c for c in data['calls'] if c.get('assigneeId') == g.user['id']] if k == 'calls' else [] for k in COLLECTIONS}
+            archived = {p['id'] for p in data['partners'] if p.get('archived')}
+            calls = [c for c in data['calls'] if c.get('assigneeId') == g.user['id'] and in_call_queue(c, archived)]
+            data = {k: calls if k == 'calls' else [] for k in COLLECTIONS}
+        elif g.user['role'] == 'member':
+            data['calls'] = [c for c in data['calls'] if c.get('assigneeId') == g.user['id']]
         return jsonify(revision=row['revision'], data=data)
 
     def validate_state(data):
@@ -290,6 +301,8 @@ def create_app(config=None):
                 for k,v in row.items():
                     if k == 'docs' and key == 'partners':
                         if not isinstance(v,list) or any(type(x) is not int or not 0 <= x < 7 for x in v): abort(400)
+                    elif isinstance(v, float) and not math.isfinite(v):
+                        abort(400, 'Неверное число')
                     elif type(v) not in (str,int,float,bool) and v is not None:
                         abort(400, 'Недопустимое значение записи')
                     elif isinstance(v,str) and len(v)>50000:
@@ -311,8 +324,7 @@ def create_app(config=None):
                         abort(400, 'Неверный тип контрагента')
                     if type(row.get('archived', False)) is not bool:
                         abort(400, 'Неверный статус архива')
-                    if row.get('archived') and not str(row.get('archiveReason','')).strip():
-                        abort(400, 'Укажи причину архивации')
+                    validate_partner(row)
                 if key == 'notes' and not row.get('text'):
                     abort(400, 'Заметка не может быть пустой')
                 if key in ('items','partners','deals','calls','templates') and not row.get('name'): abort(400, 'Запись без названия')
@@ -330,15 +342,24 @@ def create_app(config=None):
         payload = request.get_json() or {}
         data, revision = payload.get('data'), payload.get('revision')
         if session.get('mobile_member'):
+            if not isinstance(data, dict) or type(revision) is not int:
+                abort(400)
             with db() as q:
                 row = q('SELECT revision,data FROM workspace WHERE id=1').fetchone()
                 if revision != row['revision']:
                     abort(409, 'Обнови задачи')
                 full = json.loads(row['data'])
                 task = next((c for c in full['calls'] if c['id'] == (data or {}).get('taskId') and c.get('assigneeId') == g.user['id']), None)
-                if task is None or type((data or {}).get('done')) is not bool:
+                archived = {p['id'] for p in full['partners'] if p.get('archived')}
+                if task is None or not in_call_queue(task, archived) or type(data.get('done')) is not bool:
                     abort(403, 'Можно менять статус только своей задачи')
+                prior = dict(task)
                 task['done'] = data['done']
+                repeat_parents = {c.get('repeatParent') for c in full['calls']}
+                following = repeat_task(task, prior, repeat_parents)
+                if following and task.get('partner') not in archived and not task.get('deletionRequested'):
+                    full['calls'].append(following)
+                validate_state(full)
                 if not q('UPDATE workspace SET data=?,revision=revision+1 WHERE id=1 AND revision=?', (json.dumps(full, ensure_ascii=False), revision)).rowcount:
                     abort(409)
             return jsonify(revision=revision+1)
@@ -373,11 +394,24 @@ def create_app(config=None):
                 old = old_partners.get(pid, {})
                 if any(partner.get(k) != old.get(k) for k in deletion_fields):
                     abort(403, 'Пометка на удаление изменяется отдельной кнопкой')
+            normalize_partners(data)
+            partner_transitions(data, previous_data, g.user['name'])
+            old_deals = {d['id']: d for d in previous_data['deals']}
+            archived = {p['id'] for p in data['partners'] if p.get('archived')}
+            for deal in data['deals']:
+                partner_id = deal.get('partnerId')
+                if partner_id in archived and partner_id != old_deals.get(deal['id'], {}).get('partnerId'):
+                    abort(409, 'Контрагент находится в архиве')
+            active_users = {u['id'] for u in q('SELECT id FROM users WHERE active=1').fetchall()}
+            task_transitions(data, previous_data, g.user, active_users)
+            validate_state(data)
             result = q('UPDATE workspace SET data=?,revision=revision+1 WHERE id=1 AND revision=?',
                        (json.dumps(data, ensure_ascii=False, allow_nan=False), revision))
             if not result.rowcount:
                 abort(409, 'База изменена другим сотрудником. Обнови данные и повтори изменение')
             audit(q, g.user['login'], 'Изменение базы', str(revision+1))
+        if g.user['role'] == 'member':
+            data['calls'] = [c for c in data['calls'] if c.get('assigneeId') == g.user['id']]
         return jsonify(revision=revision+1, data=data)
 
     def admin():
@@ -401,7 +435,7 @@ def create_app(config=None):
                 abort(409, 'База изменилась. Обнови данные и повтори действие')
             data = json.loads(row['data'])
             call = next((c for c in data['calls'] if c['id'] == cid), None)
-            if not call:
+            if not call or (g.user['role'] == 'member' and call.get('assigneeId') != g.user['id']):
                 abort(404, 'Задача не найдена')
             if action == 'mark':
                 if call.get('deletionRequested'):
@@ -530,7 +564,7 @@ def create_app(config=None):
             row = q('SELECT revision,data FROM workspace WHERE id=1').fetchone()
             if mode == 'commit' and request.form.get('revision') != str(row['revision']):
                 abort(409, 'База изменилась. Повтори предварительный просмотр импорта')
-            data = json.loads(row['data'])
+            data = normalize_partners(json.loads(row['data']))
             try:
                 result = merge_contacts(data, rows)
             except ValueError as exc:
@@ -547,37 +581,18 @@ def create_app(config=None):
                       f"Добавлено: {result['added']}; пропущено: {result['skipped']}")
         return jsonify(**result, revision=revision)
 
-    @app.get('/api/chat/users')
-    def chat_users():
-        with db() as q:
-            rows = q('SELECT id,name FROM users WHERE active=1 ORDER BY name').fetchall()
-        return jsonify(users=[dict(u) for u in rows])
-
-    @app.get('/api/chat')
-    def chat_read():
-        peer = request.args.get('peer', '')
-        me = g.user['id']
-        with db() as q:
-            if peer:
-                rows = q('SELECT * FROM chat_messages WHERE (sender=? AND recipient=?) OR (sender=? AND recipient=?) ORDER BY created DESC,id DESC LIMIT 200', (me,peer,peer,me)).fetchall()
-            else:
-                rows = q("SELECT * FROM chat_messages WHERE recipient='' ORDER BY created DESC,id DESC LIMIT 200").fetchall()
-        return jsonify(messages=[dict(x) for x in reversed(rows)])
-
-    @app.post('/api/chat')
-    def chat_send():
-        data = request.get_json()
-        peer, body = data.get('peer',''), data.get('text','')
-        if not isinstance(peer,str) or not isinstance(body,str) or not 1 <= len(body.strip()) <= 10000:
-            abort(400, 'Неверное сообщение')
-        with db() as q:
-            if peer and not q('SELECT id FROM users WHERE id=? AND active=1',(peer,)).fetchone():
-                abort(404, 'Сотрудник не найден')
-            q('INSERT INTO chat_messages VALUES (?,?,?,?,?,?)',(str(uuid.uuid4()),g.user['id'],g.user['name'],peer,body.strip(),int(time.time()*1000)))
-        return jsonify(ok=True),201
-
+    register_chat(app, db)
+    register_contracts(app, db, admin, audit)
+    register_diadoc(app, db, admin, audit)
     register_routes(app, db)
     register_documents(app, db, audit, admin)
+
+    @app.get('/api/task-assignees')
+    def task_assignees():
+        admin()
+        with db() as q:
+            rows = q('SELECT id,name FROM users WHERE active=1 ORDER BY name').fetchall()
+        return jsonify(users=[dict(row) for row in rows])
 
     @app.get('/api/users')
     def users():

@@ -3,6 +3,7 @@ from datetime import date, datetime, timezone
 from zipfile import ZipFile, BadZipFile
 from openpyxl import load_workbook
 import uuid
+from crm_workspace import partner_keys
 
 MAX_ROWS = 10000
 
@@ -60,27 +61,32 @@ def read_contacts(stream):
 
 
 def merge_contacts(data, rows):
-    inns = {p.get('inn', '').strip() for p in data['partners'] if p.get('inn', '').strip()}
-    names = {' '.join(p['name'].casefold().split()) for p in data['partners']}
+    keys = [partner_keys(p) for p in data['partners']]
+    inns = {inn for inn, _ in keys if inn}
+    names = {name for _, name in keys}
+    names_without_inn = {name for inn, name in keys if not inn}
     added, skipped, preview = 0, 0, []
     for row in rows:
         name = row.get('Компания') or row.get('Название')
-        inn = row.get('ИНН', '')
-        key = ' '.join(name.casefold().split())
-        if (inn in inns if inn else key in names):
+        inn, key = partner_keys({'inn': row.get('ИНН', ''), 'name': name})
+        duplicate = (inn in inns or key in names_without_inn) if inn else key in names
+        if duplicate:
             skipped += 1
             continue
         pid = str(uuid.uuid4())
         details = '\n'.join(f'{k}: {v}' for k, v in row.items() if v and k != '№')
         if len(details) > 50000:
             raise ValueError('Слишком много текста в строке компании')
-        data['partners'].append(dict(id=pid, name=name, inn=inn, role='Клиент',
+        data['partners'].append(dict(id=pid, name=name, inn=inn, role='Грузоотправитель',
             phone=row.get('Телефон', ''), email=row.get('Email', ''), contact=row.get('Контактное лицо', ''),
             city=row.get('Город / район', ''), industry=row.get('Отрасль', ''), website=row.get('Сайт', ''),
             checked='', result='', docs=[]))
         data['notes'].insert(0, dict(id=str(uuid.uuid4()), partner=pid,
             date=datetime.now(timezone.utc).isoformat(), text='Импорт из Excel\n' + details))
-        inns.add(inn) if inn else None
+        if inn:
+            inns.add(inn)
+        else:
+            names_without_inn.add(key)
         names.add(key)
         added += 1
         if len(preview) < 10:
