@@ -372,8 +372,13 @@ def create_app(config=None):
                 abort(409, 'База изменена другим сотрудником. Обнови данные и повтори изменение')
             previous_data = json.loads(previous['data'])
             old_items = {item['id']: item for item in previous_data['items']}
+            if g.user['role'] == 'member' and old_items.keys() - {item['id'] for item in data['items']}:
+                abort(403, 'Удалять заявки может только администратор')
+            deletion_fields = ('deletionRequested', 'deletionBy', 'deletionReason', 'deletionAt')
             for item in data['items']:
                 old = old_items.get(item['id'])
+                if any(item.get(key) != (old or {}).get(key) for key in deletion_fields):
+                    abort(403, 'Пометка на удаление изменяется отдельной кнопкой')
                 if old is None:
                     item.update(createdBy=g.user['name'], createdById=g.user['id'],
                                 createdByLogin=g.user['login'], createdAt=int(time.time()))
@@ -389,7 +394,6 @@ def create_app(config=None):
                 abort(403, 'Архивные карточки нельзя удалять')
             if g.user['role'] == 'member' and old_partners.keys() - new_partners.keys():
                 abort(403, 'Удалять контрагентов может только администратор. Поставь пометку на удаление')
-            deletion_fields = ('deletionRequested', 'deletionBy', 'deletionReason', 'deletionAt')
             for pid, partner in new_partners.items():
                 old = old_partners.get(pid, {})
                 if any(partner.get(k) != old.get(k) for k in deletion_fields):
@@ -418,8 +422,13 @@ def create_app(config=None):
         if g.user['role'] not in ('owner','admin'):
             abort(403, 'Доступно только администратору')
 
-    @app.post('/api/calls/<cid>/deletion')
-    def call_deletion(cid):
+    @app.post('/api/calls/<record_id>/deletion', defaults={'collection': 'calls'})
+    @app.post('/api/items/<record_id>/deletion', defaults={'collection': 'items'})
+    def record_deletion(record_id, collection):
+        is_task = collection == 'calls'
+        if not is_task and session.get('mobile_member'):
+            abort(403)
+        label = 'задачи' if is_task else 'заявки'
         payload = request.get_json()
         action, expected = payload.get('action'), payload.get('revision')
         if action not in ('mark', 'cancel', 'delete') or type(expected) is not int:
@@ -434,28 +443,28 @@ def create_app(config=None):
             if row['revision'] != expected:
                 abort(409, 'База изменилась. Обнови данные и повтори действие')
             data = json.loads(row['data'])
-            call = next((c for c in data['calls'] if c['id'] == cid), None)
-            if not call or (g.user['role'] == 'member' and call.get('assigneeId') != g.user['id']):
-                abort(404, 'Задача не найдена')
+            record = next((record for record in data[collection] if record['id'] == record_id), None)
+            if not record or (is_task and g.user['role'] == 'member' and record.get('assigneeId') != g.user['id']):
+                abort(404, 'Задача не найдена' if is_task else 'Заявка не найдена')
             if action == 'mark':
-                if call.get('deletionRequested'):
+                if record.get('deletionRequested'):
                     abort(409, 'Запрос уже отправлен')
-                call.update(deletionRequested=True, deletionBy=g.user['name'],
+                record.update(deletionRequested=True, deletionBy=g.user['name'],
                             deletionReason=reason.strip(), deletionAt=str(int(time.time())))
-                event = 'Запрос на удаление задачи'
+                event = f'Запрос на удаление {label}'
             elif action == 'cancel':
                 for key in ('deletionRequested', 'deletionBy', 'deletionReason', 'deletionAt'):
-                    call.pop(key, None)
-                event = 'Отмена пометки на удаление задачи'
+                    record.pop(key, None)
+                event = f'Отмена пометки на удаление {label}'
             else:
-                data['calls'] = [c for c in data['calls'] if c['id'] != cid]
-                event = 'Удаление задачи'
+                data[collection] = [row for row in data[collection] if row['id'] != record_id]
+                event = f'Удаление {label}'
             validate_state(data)
             updated = q('UPDATE workspace SET data=?,revision=revision+1 WHERE id=1 AND revision=?',
                         (json.dumps(data, ensure_ascii=False, allow_nan=False), expected))
             if not updated.rowcount:
                 abort(409, 'База изменилась. Обнови данные и повтори действие')
-            audit(q, g.user['login'], event, call['name'] + ('; '+reason.strip() if action == 'mark' and reason.strip() else ''))
+            audit(q, g.user['login'], event, record['name'] + ('; '+reason.strip() if action == 'mark' and reason.strip() else ''))
         return jsonify(revision=expected+1)
 
     @app.post('/api/partners/<pid>/work')

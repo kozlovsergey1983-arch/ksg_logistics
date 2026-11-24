@@ -150,6 +150,36 @@ class CRMTest(unittest.TestCase):
     def write(self, client, state):
         return self.post(client, '/api/state', state, 'PUT')
 
+    def test_item_deletion_permissions_and_revision(self):
+        member, _ = self.ready_member()
+        state = self.owner.get('/api/state').json
+        state['data']['items'] = [
+            {'id': kind, 'name': 'Тестовая заявка', 'kind': kind, 'from': 'Москва', 'to': 'Тула'}
+            for kind in ('cargo', 'truck')
+        ]
+        self.assertEqual(self.write(self.owner, state).status_code, 200)
+        for kind in ('cargo', 'truck'):
+            path = f'/api/items/{kind}/deletion'
+            state = member.get('/api/state').json
+            revision = state['revision']
+            mark = dict(action='mark', revision=revision, reason='Устарела')
+            self.assertEqual(self.post(member, path, dict(action='delete', revision=revision)).status_code, 403)
+            state['data']['items'] = [item for item in state['data']['items'] if item['id'] != kind]
+            self.assertEqual(self.write(member, state).status_code, 403)
+            self.assertEqual(self.post(member, path, mark).status_code, 200)
+            self.assertEqual(self.post(member, path, mark).status_code, 409)
+            latest = self.owner.get('/api/state').json
+            item = next(item for item in latest['data']['items'] if item['id'] == kind)
+            self.assertTrue(item['deletionRequested'])
+            self.assertEqual(item['deletionReason'], 'Устарела')
+            current = latest['revision']
+            item.pop('deletionRequested')
+            self.assertEqual(self.write(member, latest).status_code, 403)
+            self.assertEqual(self.post(member, path, dict(action='cancel', revision=current)).status_code, 403)
+            self.assertEqual(self.post(self.owner, path, dict(action='cancel', revision=current)).status_code, 200)
+            self.assertEqual(self.post(self.owner, path, dict(action='delete', revision=current + 1)).status_code, 200)
+        self.assertEqual(self.owner.get('/api/state').json['data']['items'], [])
+
     def test_partner_archive_contacts_existing_cards_and_excel(self):
         import io
         from openpyxl import Workbook
