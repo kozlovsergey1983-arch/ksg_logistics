@@ -27,6 +27,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 ROOT = Path(__file__).parent
 COLLECTIONS = ('items', 'partners', 'deals', 'calls', 'notes', 'templates')
 SCHEMA = [
+    "CREATE TABLE IF NOT EXISTS chat_messages (id TEXT PRIMARY KEY, sender TEXT NOT NULL, sender_name TEXT NOT NULL, recipient TEXT NOT NULL, body TEXT NOT NULL, created BIGINT NOT NULL)",
     'CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, login TEXT UNIQUE NOT NULL, name TEXT NOT NULL, password TEXT NOT NULL, role TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, must_change INTEGER NOT NULL DEFAULT 1)',
     'CREATE TABLE IF NOT EXISTS deleted_users (user_id TEXT PRIMARY KEY REFERENCES users(id))',
     'CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), expires BIGINT NOT NULL)',
@@ -545,6 +546,35 @@ def create_app(config=None):
                 audit(q, g.user['login'], 'Импорт Excel',
                       f"Добавлено: {result['added']}; пропущено: {result['skipped']}")
         return jsonify(**result, revision=revision)
+
+    @app.get('/api/chat/users')
+    def chat_users():
+        with db() as q:
+            rows = q('SELECT id,name FROM users WHERE active=1 ORDER BY name').fetchall()
+        return jsonify(users=[dict(u) for u in rows])
+
+    @app.get('/api/chat')
+    def chat_read():
+        peer = request.args.get('peer', '')
+        me = g.user['id']
+        with db() as q:
+            if peer:
+                rows = q('SELECT * FROM chat_messages WHERE (sender=? AND recipient=?) OR (sender=? AND recipient=?) ORDER BY created DESC,id DESC LIMIT 200', (me,peer,peer,me)).fetchall()
+            else:
+                rows = q("SELECT * FROM chat_messages WHERE recipient='' ORDER BY created DESC,id DESC LIMIT 200").fetchall()
+        return jsonify(messages=[dict(x) for x in reversed(rows)])
+
+    @app.post('/api/chat')
+    def chat_send():
+        data = request.get_json()
+        peer, body = data.get('peer',''), data.get('text','')
+        if not isinstance(peer,str) or not isinstance(body,str) or not 1 <= len(body.strip()) <= 10000:
+            abort(400, 'Неверное сообщение')
+        with db() as q:
+            if peer and not q('SELECT id FROM users WHERE id=? AND active=1',(peer,)).fetchone():
+                abort(404, 'Сотрудник не найден')
+            q('INSERT INTO chat_messages VALUES (?,?,?,?,?,?)',(str(uuid.uuid4()),g.user['id'],g.user['name'],peer,body.strip(),int(time.time()*1000)))
+        return jsonify(ok=True),201
 
     register_routes(app, db)
     register_documents(app, db, audit, admin)
