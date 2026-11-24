@@ -305,6 +305,13 @@ def create_app(config=None):
                         abort(400, 'Ставка, вес, объём и расстояние должны быть числами')
                     if not math.isfinite(number) or number < 0:
                         abort(400, 'Ставка, вес, объём и расстояние должны быть неотрицательными числами')
+                if key == 'partners':
+                    if row.get('role', 'Клиент') not in ('Клиент','Грузоотправитель','Перевозчик','Оба'):
+                        abort(400, 'Неверный тип контрагента')
+                    if type(row.get('archived', False)) is not bool:
+                        abort(400, 'Неверный статус архива')
+                    if row.get('archived') and not str(row.get('archiveReason','')).strip():
+                        abort(400, 'Укажи причину архивации')
                 if key == 'notes' and not row.get('text'):
                     abort(400, 'Заметка не может быть пустой')
                 if key in ('items','partners','deals','calls','templates') and not row.get('name'): abort(400, 'Запись без названия')
@@ -356,6 +363,8 @@ def create_app(config=None):
                             item.pop(field, None)
             old_partners = {p['id']: p for p in previous_data['partners']}
             new_partners = {p['id']: p for p in data['partners']}
+            if any(old_partners[pid].get('archived') for pid in old_partners.keys() - new_partners.keys()):
+                abort(403, 'Архивные карточки нельзя удалять')
             if g.user['role'] == 'member' and old_partners.keys() - new_partners.keys():
                 abort(403, 'Удалять контрагентов может только администратор. Поставь пометку на удаление')
             deletion_fields = ('deletionRequested', 'deletionBy', 'deletionReason', 'deletionAt')
@@ -428,6 +437,8 @@ def create_app(config=None):
             partner = next((p for p in data['partners'] if p['id'] == pid), None)
             if not partner:
                 abort(404, 'Контрагент не найден')
+            if partner.get('archived'):
+                abort(409, 'Контрагент находится в архиве')
             if partner.get('deletionRequested'):
                 abort(409, 'Контрагент помечен на удаление')
             if action == 'take':
@@ -482,6 +493,8 @@ def create_app(config=None):
                     partner.pop(key, None)
                 event = 'Отмена пометки на удаление'
             else:
+                if partner.get('archived'):
+                    abort(403, 'Архивные карточки нельзя удалять')
                 data['partners'] = [p for p in data['partners'] if p['id'] != pid]
                 # Preserve history and reminders, removing the reference to a deleted card.
                 for collection in ('notes', 'calls'):
