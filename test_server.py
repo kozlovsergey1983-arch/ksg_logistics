@@ -137,5 +137,277 @@ class CRMTest(unittest.TestCase):
             self.assertTrue(row['password'].startswith('scrypt:'))
         self.assertGreaterEqual(len(self.owner.get('/api/audit').json['events']),3)
 
+    def ready_member(self):
+        member = self.member()
+        self.post(member, '/api/password', dict(old='worker-initial-test-password', password='worker-changed-test-password'))
+        user = self.login(member, 'worker', 'worker-changed-test-password')['user']
+        return member, user['id']
+
+    def upload(self, client, path, data):
+        csrf = client.get('/api/session').json['csrf']
+        return client.post(path, data=data, headers={'X-CSRF-Token': csrf})
+
+    def write(self, client, state):
+        return self.post(client, '/api/state', state, 'PUT')
+
+    def test_partner_archive_contacts_existing_cards_and_excel(self):
+        import io
+        from openpyxl import Workbook
+
+        state = self.owner.get('/api/state').json
+        contacts = json.dumps([dict(phone='+70000000002', name='Анна', position='Логист', comment='После 10')])
+        partner = dict(id='partner', name='Тестовая компания', inn='0000000000', role='Клиент',
+                       phone='+70000000001', extraPhones=contacts)
+        raw = state['data']
+        raw['partners'].append(partner)
+        with self.app.crm_db() as q:
+            q('UPDATE workspace SET data=? WHERE id=1', (json.dumps(raw),))
+        state = self.owner.get('/api/state').json
+        self.assertEqual(state['data']['partners'][0]['role'], 'Грузоотправитель')
+        target = state['data']['partners'][0]
+        target['role'] = 'Оба'
+        target.update(archived=True, archiveReason='  ')
+        self.assertEqual(self.write(self.owner, state).status_code, 400)
+        target['archived'] = False
+        r = self.write(self.owner, state)
+        self.assertEqual(r.status_code, 200, r.json)
+        result = self.post(self.owner, '/api/partners/partner/work', dict(action='take', revision=r.json['revision']))
+        self.assertEqual(result.status_code, 200, result.json)
+        state = self.owner.get('/api/state').json
+        state['data']['partners'][0].update(archived=True, archiveReason='Договор завершён')
+        self.assertEqual(self.write(self.owner, state).status_code, 200)
+        state = self.owner.get('/api/state').json
+        archived = state['data']['partners'][0]
+        self.assertEqual((archived['role'], archived['phone'], archived['extraPhones']), ('Оба', partner['phone'], contacts))
+        self.assertNotIn('workById', archived)
+        self.assertIn('Договор завершён', state['data']['notes'][0]['text'])
+        take = self.post(self.owner, '/api/partners/partner/work', dict(action='take', revision=state['revision']))
+        self.assertEqual(take.status_code, 409)
+        state['data']['partners'].append(dict(id='another', name='Другое название', inn='00000 00000'))
+        self.assertEqual(self.write(self.owner, state).status_code, 409)
+        book = Workbook()
+        book.active.append(['Компания', 'ИНН'])
+        book.active.append(['Импортированный дубль', '00000 00000'])
+        book.active.append(['Тестовая компания', ''])
+        stream = io.BytesIO()
+        book.save(stream)
+        stream.seek(0)
+        result = self.upload(self.owner, '/api/import/excel', dict(file=(stream, 'contacts.xlsx'), mode='commit', revision=str(state['revision'])))
+        self.assertEqual(result.status_code, 200, result.json)
+        self.assertEqual((result.json['added'], result.json['skipped']), (0, 2))
+        state['data']['partners'].pop()
+        state['data']['partners'][0].update(archived=False, archiveReason='')
+        restored = self.write(self.owner, state)
+        self.assertEqual(restored.status_code, 200)
+        self.assertEqual(len(restored.json['data']['notes']), 2)
+
+    def test_concurrent_workspace_writes_do_not_overwrite(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+
+        clients = [self.owner, self.app.test_client()]
+        self.login(clients[1], 'admin', 'owner-changed-test-password')
+        barrier = Barrier(2)
+
+        def save(index):
+            client = clients[index]
+            state = client.get('/api/state').json
+            state['data']['notes'].append(dict(id=f'concurrent-{index}', text='Синтетическая запись'))
+            barrier.wait(timeout=5)
+            return self.write(client, state).status_code
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            self.assertEqual(sorted(pool.map(save, [0, 1])), [200, 409])
+        state = self.owner.get('/api/state').json
+        self.assertEqual(state['revision'], 1)
+        self.assertEqual(len(state['data']['notes']), 1)
+
+    def test_archived_partner_preserves_tasks_and_blocks_queue(self):
+        _, member_id = self.ready_member()
+        mobile = self.app.test_client()
+        self.login(mobile, 'mobile:worker', 'worker-changed-test-password')
+        state = self.owner.get('/api/state').json
+        state['data']['partners'].append(dict(id='partner', name='Архивируемая компания'))
+        state['data']['calls'].append(dict(id='cold', name='Холодный звонок', taskType='Холодный звонок',
+            assigneeId=member_id, date='2026-12-05', time='10:00', partner='partner'))
+        self.assertEqual(self.write(self.owner, state).status_code, 200)
+        self.assertEqual(len(mobile.get('/api/state').json['data']['calls']), 1)
+        state = self.owner.get('/api/state').json
+        state['data']['partners'][0].update(archived=True, archiveReason='Контакт завершён')
+        self.assertEqual(self.write(self.owner, state).status_code, 200)
+        state = self.owner.get('/api/state').json
+        self.assertEqual(len(state['data']['calls']), 1)
+        self.assertEqual(mobile.get('/api/state').json['data']['calls'], [])
+        self.assertEqual(self.write(mobile, dict(revision=state['revision'], data=dict(taskId='cold', done=True))).status_code, 403)
+        state['data']['calls'].append(dict(id='fresh', name='Новый звонок', partner='partner'))
+        self.assertEqual(self.write(self.owner, state).status_code, 409)
+
+    def test_calendar_web_mobile_permissions_and_repeat(self):
+        member, member_id = self.ready_member()
+        mobile = self.app.test_client()
+        self.login(mobile, 'mobile:worker', 'worker-changed-test-password')
+        state = self.owner.get('/api/state').json
+        state['data']['calls'] = [
+            dict(id='private', name='Только для администратора', date='2026-12-01', time='10:00'),
+            dict(id='scheduled', name='Встреча', taskType='Встреча', date='2026-12-02', time='09:00',
+                 assigneeId=member_id, repeat='weekly', reminder='60', done=False),
+        ]
+        self.assertEqual(self.write(self.owner, state).status_code, 200)
+        state = member.get('/api/state').json
+        self.assertEqual([c['id'] for c in state['data']['calls']], ['scheduled'])
+        self.assertEqual(mobile.get('/api/state').json['data']['calls'], state['data']['calls'])
+        self.assertEqual(self.post(member, '/api/calls/private/deletion', dict(action='mark', revision=state['revision'])).status_code, 404)
+        state['data']['calls'][0]['assigneeId'] = ''
+        self.assertEqual(self.write(member, state).status_code, 403)
+        done = self.write(mobile, dict(revision=state['revision'], data=dict(taskId='scheduled', done=True)))
+        self.assertEqual(done.status_code, 200, done.json)
+        self.assertEqual(self.write(mobile, dict(revision=state['revision'], data=dict(taskId='scheduled', done=True))).status_code, 409)
+        data = member.get('/api/state').json
+        first, repeat = data['data']['calls']
+        self.assertTrue(first['done'])
+        self.assertEqual((repeat['date'], repeat['reminder'], repeat['done']), ('2026-12-09', '60', False))
+        first['done'] = False
+        self.assertEqual(self.write(member, data).status_code, 200)
+        data = member.get('/api/state').json
+        data['data']['calls'][0]['done'] = True
+        self.assertEqual(len(self.write(member, data).json['data']['calls']), 2)
+        self.assertEqual(len(self.owner.get('/api/state').json['data']['calls']), 3)
+
+    def test_chat_files_read_receipts_private_and_mobile(self):
+        import io
+
+        member, member_id = self.ready_member()
+        owner_id = self.owner.get('/api/session').json['user']['id']
+        third = self.app.test_client()
+        self.post(self.owner, '/api/users', dict(login='third', name='Третий', password='third-initial-test-password'))
+        self.login(third, 'third', 'third-initial-test-password')
+        self.post(third, '/api/password', dict(old='third-initial-test-password', password='third-changed-test-password'))
+        self.login(third, 'third', 'third-changed-test-password')
+        state = self.owner.get('/api/state').json
+        state['data']['partners'].append(dict(id='company', name='Компания'))
+        self.assertEqual(self.write(self.owner, state).status_code, 200)
+        result = self.upload(self.owner, '/api/chat', dict(peer=member_id, text='Личное',
+            kind='partners', card_id='company', file=(io.BytesIO(b'test file'), 'test.txt')))
+        self.assertEqual(result.status_code, 201, result.json)
+        mid = result.json['id']
+        path = '/api/chat/files/' + mid
+        self.assertEqual(third.get(path).status_code, 404)
+        self.assertEqual(third.get('/api/chat?peer=' + owner_id).json['messages'], [])
+        self.assertEqual(third.get('/api/chat/unread').json['conversations'], [])
+        self.assertEqual(member.get(path).data, b'test file')
+        self.assertEqual(member.get('/api/chat?peer=' + owner_id).json['messages'][0]['card_id'], 'company')
+        self.assertEqual(member.get('/api/chat/unread').json['conversations'][0]['count'], 1)
+        self.assertEqual(self.post(member, '/api/chat/read', dict(ids=[mid])).status_code, 200)
+        self.assertEqual(self.post(member, '/api/chat/read', dict(ids=[mid])).status_code, 200)
+        self.assertEqual(member.get('/api/chat/unread').json['conversations'], [])
+        self.assertEqual(self.owner.get('/api/chat?peer=' + member_id).json['messages'][0]['read_count'], 1)
+        mobile = self.app.test_client()
+        self.login(mobile, 'mobile:worker', 'worker-changed-test-password')
+        self.assertNotIn('card_id', mobile.get('/api/chat?peer=' + owner_id).json['messages'][0])
+        self.assertEqual(self.post(mobile, '/api/chat', dict(text='Общий')).status_code, 201)
+        self.assertEqual(third.get('/api/chat').json['messages'][0]['body'], 'Общий')
+
+    def test_chat_history_cursor_stays_within_conversation(self):
+        member, member_id = self.ready_member()
+        owner_id = self.owner.get('/api/session').json['user']['id']
+        with self.app.crm_db() as q:
+            for index in range(201):
+                q('INSERT INTO chat_messages VALUES (?,?,?,?,?,?)',
+                  (f'group-{index:03}', owner_id, 'Владелец', '', str(index), 1000))
+            q('INSERT INTO chat_messages VALUES (?,?,?,?,?,?)',
+              ('private', owner_id, 'Владелец', member_id, 'Только получателю', 1000))
+        first = member.get('/api/chat').json
+        self.assertEqual(len(first['messages']), 200)
+        remaining = member.get('/api/chat', query_string={'before': first['before']}).json
+        self.assertEqual([m['id'] for m in remaining['messages']], ['group-000'])
+        self.assertEqual(remaining['before'], '')
+        self.assertEqual(member.get('/api/chat?peer=' + owner_id).json['messages'][0]['id'], 'private')
+
+    def make_contract(self):
+        import io
+        from docx import Document
+
+        self.app.config['CONTRACT_COMPANY'] = dict(name='Синтетическая КСГ', inn='0000000000')
+        state = self.owner.get('/api/state').json
+        state['data']['partners'].append(dict(id='customer', name='Тестовый заказчик', inn='1111111111', kpp='111111111'))
+        state['data']['deals'].append(dict(id='deal', name='Маршрут', status='Новая', partnerId='customer'))
+        self.assertEqual(self.write(self.owner, state).status_code, 200)
+        template = Document()
+        paragraph = template.add_paragraph('Договор {{num')
+        paragraph.add_run('ber}}').bold = True
+        template.add_paragraph('{{company.name}} / {{partner.name}} / {{partner.kpp}} / {{route}}')
+        stream = io.BytesIO()
+        template.save(stream)
+        stream.seek(0)
+        result = self.upload(self.owner, '/api/contracts/templates', dict(name='Шаблон', file=(stream, 'contract.docx')))
+        self.assertEqual(result.status_code, 201, result.json)
+        data = dict(template=result.json['id'], partner='customer', deal='deal', route='Москва – Тула', rate='10000')
+        contract = self.post(self.owner, '/api/contracts', data)
+        self.assertEqual(contract.status_code, 201, contract.json)
+        return contract.json, data
+
+    def test_contract_generation_links_status_and_pdf(self):
+        import io
+        import shutil
+        from docx import Document
+
+        contract, data = self.make_contract()
+        next_contract = self.post(self.owner, '/api/contracts', data).json
+        self.assertNotEqual(contract['number'], next_contract['number'])
+        cid = contract['id']
+        path = '/api/contracts/' + cid
+        response = self.owner.get(path + '/docx')
+        self.assertEqual(response.status_code, 200)
+        doc = Document(io.BytesIO(response.data))
+        self.assertEqual(doc.paragraphs[0].text, 'Договор ' + contract['number'])
+        self.assertIn('Тестовый заказчик / 111111111 / Москва – Тула', doc.paragraphs[1].text)
+        self.assertEqual(len(self.owner.get('/api/contracts?partner=customer&deal=deal').json['contracts']), 2)
+        self.assertEqual(self.owner.get('/api/contracts?deal=other').json['contracts'], [])
+        status = dict(status='На согласовании', expected='Черновик')
+        self.assertEqual(self.post(self.owner, path, status, 'PATCH').status_code, 200)
+        self.assertEqual(self.post(self.owner, path, status, 'PATCH').status_code, 409)
+        response = self.owner.get(path + '/pdf')
+        self.assertEqual(response.status_code, 200 if shutil.which('libreoffice') else 503)
+        if response.status_code == 200:
+            self.assertTrue(response.data.startswith(b'%PDF-'))
+            self.assertEqual(self.owner.get(path + '/pdf').data, response.data)
+
+    def test_diadoc_adapter_signer_recipient_and_idempotency(self):
+        from unittest.mock import Mock
+
+        contract, _ = self.make_contract()
+        cid = contract['id']
+        self.assertEqual(self.owner.get('/api/diadoc/organizations?inn=1111111111').status_code, 503)
+        member, _ = self.ready_member()
+        self.assertEqual(member.get('/api/diadoc').status_code, 403)
+        self.app.config['DIADOC'] = dict(token='fake-test-token', box='sender', signer='not-admin')
+        path = '/api/diadoc/contracts/' + cid
+        payload = dict(box='recipient', signature='dGVzdA==')
+        self.assertEqual(self.post(self.owner, path, payload).status_code, 403)
+        self.app.config['DIADOC']['signer'] = 'admin'
+        with self.app.crm_db() as q:
+            q('INSERT INTO contract_pdfs VALUES (?,?)', (cid, b'%PDF-mocked'))
+        mock = Mock(side_effect=[
+            ({'Organizations': [{'Boxes': [{'BoxId': 'wrong'}]}]}, 200),
+            ({'Organizations': [{'Boxes': [{'BoxId': 'recipient'}]}]}, 200),
+            ({'ToBoxId': 'recipient', 'MessageId': 'message', 'Entities': [{'EntityType': 'Attachment', 'EntityId': 'document'}]}, 200),
+            ({'TaskId': 'task'}, 200), ({'Status': 'Success'}, 200),
+            ({'Documents': []}, 200), ({'DocumentStatus': 'Signed'}, 200), (b'test', 200),
+        ])
+        self.app.config['DIADOC_TRANSPORT'] = mock
+        self.assertEqual(self.post(self.owner, path, payload).status_code, 400)
+        sent = self.post(self.owner, path, payload)
+        self.assertEqual(sent.status_code, 201, sent.json)
+        self.assertEqual(sent.json['entity_id'], 'document')
+        self.assertEqual(mock.call_args.args[1], {'operationId': cid})
+        self.assertEqual(mock.call_args.args[3]['DocumentAttachments'][0]['SignedContent']['Signature'], 'dGVzdA==')
+        self.assertEqual(self.post(self.owner, path, payload).status_code, 200)
+        self.assertEqual(mock.call_count, 3)
+        self.assertEqual(self.post(self.owner, '/api/diadoc/invitations', dict(box='recipient')).json['TaskId'], 'task')
+        self.assertEqual(self.owner.get('/api/diadoc/invitations/task').json['Status'], 'Success')
+        self.assertEqual(self.owner.get('/api/diadoc/documents').json['Documents'], [])
+        self.assertEqual(self.owner.get('/api/diadoc/documents/message/document').json['DocumentStatus'], 'Signed')
+        self.assertEqual(self.owner.get('/api/diadoc/documents/message/document/file').data, b'test')
+
 if __name__=='__main__':
     unittest.main(verbosity=2)
