@@ -3,7 +3,7 @@ const contractStatuses = ['Черновик', 'На согласовании', '
 async function contractsPage() {
     $('#app').innerHTML = heading('Договоры', 'Шаблоны Word, сформированные договоры и статусы',
         '<div class="actions"><button onclick="contractForm()">＋ Договор</button>' +
-        (currentUser.role !== 'member' ? '<button onclick="templateUploadForm()">＋ Шаблон Word</button><button onclick="diadocPanel()">Диадок</button>' : '') +
+        (currentUser.role !== 'member' ? '<button onclick="companyDetailsForm()">Реквизиты КСГ</button><button onclick="templateUploadForm()">＋ Шаблон Word</button><button onclick="diadocPanel()">Диадок</button>' : '') +
         '</div>') + '<section class="panel" id="contractRegistry" aria-live="polite"></section>';
     await loadContractList($('#contractRegistry'), '');
 }
@@ -90,7 +90,8 @@ async function contractForm(partner = '', deal = '') {
             <small data-contract-inn aria-live="polite"></small></div>
             <label>Сделка<select name="deal" onchange="contractDealChanged(this.form)">${options([['', 'Без сделки'], ...db.deals.map(d => [d.id, d.name])], deal)}</select></label>` +
             field('route', 'Маршрут', selected?.name) + field('rate', 'Ставка', selected?.client) +
-            field('cargo', 'Груз', selected?.cargo) + field('payment', 'Условия оплаты', selected?.details),
+            field('cargo', 'Груз', selected?.cargo) + field('payment', 'Условия оплаты', selected?.details) +
+            (currentUser.role !== 'member' ? '<div><button type="button" onclick="companyDetailsForm(this.form)">Реквизиты КСГ</button></div>' : ''),
             'saveContract(this)');
         refreshContractPartner($('#modal form'));
     } catch (error) {
@@ -124,6 +125,54 @@ function openContractPartner(form, focusInn = false) {
     if (focusInn) editor.elements.inn.focus();
 }
 
+const contractCompanyFields = [
+    ['name', 'Юридическое название'], ['inn', 'ИНН'], ['kpp', 'КПП'], ['ogrn', 'ОГРН / ОГРНИП'],
+    ['address', 'Юридический адрес'], ['bank', 'Банк'], ['bik', 'БИК'], ['account', 'Расчётный счёт'],
+    ['correspondentAccount', 'Корреспондентский счёт']
+];
+
+async function companyDetailsForm(draftForm = null) {
+    const modal = $('#modal'), actor = currentUser?.id;
+    const draft = draftForm ? [...modal.childNodes] : null;
+    const origin = page;
+    try {
+        const {company, revision: companyRevision} = await api('/contracts/company');
+        if (currentUser?.id !== actor || page !== origin || (draftForm && (!modal.open || !draftForm.isConnected))) return;
+        form('Реквизиты КСГ', contractCompanyFields.map(([key, label]) => field(key, label, company[key])).join(''),
+            `saveContractCompany(this,${companyRevision})`);
+        const editor = modal.querySelector('form');
+        editor.elements.name.required = true;
+        editor.elements.inn.required = true;
+        if (draft) {
+            editor.querySelector('.actions button[type=button]').textContent = 'Назад к договору';
+            modal.addEventListener('close', () => {
+                if (modal.open || currentUser?.id !== actor) return;
+                modal.replaceChildren(...draft);
+                modal.showModal();
+                draftForm.querySelector('[data-contract-partner]').focus();
+            }, {once: true});
+        }
+        if (!company.name?.trim()) editor.elements.name.focus();
+        else if (!company.inn?.trim()) editor.elements.inn.focus();
+    } catch (error) {
+        toast(error.message);
+    }
+}
+
+async function saveContractCompany(form, companyRevision) {
+    const button = form.querySelector('button.primary');
+    button.disabled = true;
+    try {
+        await api('/contracts/company', 'PUT', {company: values(form), revision: companyRevision});
+        if (form.isConnected) closeModal();
+        toast('Реквизиты КСГ сохранены');
+    } catch (error) {
+        toast(error.message);
+    } finally {
+        button.disabled = false;
+    }
+}
+
 function contractDealChanged(form) {
     const deal = db.deals.find(d => d.id === form.elements.deal.value);
     if (!deal) return;
@@ -150,6 +199,9 @@ async function saveContract(form) {
         toast('Создан договор ' + result.number);
     } catch (error) {
         toast(error.message);
+        if (error.status === 409 && error.message.includes('«Реквизиты КСГ»') && form.isConnected) {
+            await companyDetailsForm(form);
+        }
     } finally {
         button.disabled = false;
     }

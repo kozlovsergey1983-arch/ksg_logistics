@@ -23,6 +23,7 @@ CONTRACT_SCHEMA = [
     '''CREATE TABLE IF NOT EXISTS contracts (
        id TEXT PRIMARY KEY, number TEXT UNIQUE NOT NULL, partner TEXT NOT NULL, deal TEXT NOT NULL,
        status TEXT NOT NULL, created TEXT NOT NULL, snapshot TEXT NOT NULL, content BYTEA NOT NULL)''',
+    'CREATE TABLE IF NOT EXISTS contract_company (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL, data TEXT NOT NULL)',
     'CREATE TABLE IF NOT EXISTS contract_pdfs (id TEXT PRIMARY KEY REFERENCES contracts(id), content BYTEA NOT NULL)',
 ]
 STATUSES = ('Черновик', 'На согласовании', 'Подписан', 'Аннулирован')
@@ -107,6 +108,43 @@ def register_contracts(app, db, admin, audit):
         if request.path.startswith('/api/contracts') and session.get('mobile_member'):
             abort(403)
 
+    def company_details(q):
+        row = q('SELECT revision,data FROM contract_company WHERE id=1').fetchone()
+        if row:
+            return json.loads(row['data']), row['revision']
+        return {field: str(app.config['CONTRACT_COMPANY'].get(field) or '') for field in FIELDS}, 0
+
+    @app.get('/api/contracts/company')
+    def get_company():
+        admin()
+        with db() as q:
+            company, revision = company_details(q)
+        return jsonify(company=company, revision=revision)
+
+    @app.put('/api/contracts/company')
+    def update_company():
+        admin()
+        payload = request.json
+        company, revision = payload.get('company'), payload.get('revision')
+        if type(revision) is not int or not isinstance(company, dict) or set(company) != set(FIELDS):
+            abort(400, 'Неверный формат реквизитов')
+        if any(not isinstance(v, str) or len(v) > 1000 or re.search(r'[\x00-\x1f]', v) for v in company.values()):
+            abort(400, 'Проверь поля реквизитов')
+        company = {key: value.strip() for key, value in company.items()}
+        if not company['name'] or not re.fullmatch(r'(?:[0-9]{10}|[0-9]{12})', company['inn']):
+            abort(400, 'Укажи название организации и ИНН из 10 или 12 цифр')
+        encoded = json.dumps(company, ensure_ascii=False)
+        with db() as q:
+            if revision == 0:
+                changed = q('INSERT INTO contract_company VALUES (1,1,?) ON CONFLICT(id) DO NOTHING', (encoded,))
+            else:
+                changed = q('UPDATE contract_company SET revision=revision+1,data=? WHERE id=1 AND revision=?',
+                            (encoded, revision))
+            if not changed.rowcount:
+                abort(409, 'Реквизиты изменены другим администратором. Открой форму заново')
+            audit(q, g.user['login'], 'Изменение реквизитов своей организации', company['name'])
+        return jsonify(company=company, revision=revision+1)
+
     @app.get('/api/contracts/templates')
     def templates():
         with db() as q:
@@ -165,11 +203,12 @@ def register_contracts(app, db, admin, audit):
                 abort(409, 'Контрагент находится в архиве')
             if linked_deal and linked_deal.get('partnerId') and linked_deal['partnerId'] != partner:
                 abort(400, 'Выбери контрагента сделки')
-            company = app.config['CONTRACT_COMPANY']
+            company, _ = company_details(q)
             if not str(counterparty.get('inn') or '').strip():
                 abort(409, 'Укажи ИНН в карточке контрагента')
             if not str(company.get('name') or '').strip() or not str(company.get('inn') or '').strip():
-                abort(409, 'Укажи название и ИНН своей организации в CONTRACT_COMPANY_JSON')
+                abort(409, 'Укажи название и ИНН своей организации в разделе «Реквизиты КСГ»'
+                           if g.user['role'] in ('owner', 'admin') else 'Попроси администратора заполнить реквизиты КСГ')
             now = datetime.now(MOSCOW)
             sequence = q('''INSERT INTO contract_sequence VALUES (?,1)
                           ON CONFLICT(year) DO UPDATE SET value=contract_sequence.value+1 RETURNING value''',

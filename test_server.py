@@ -383,6 +383,23 @@ class CRMTest(unittest.TestCase):
         self.assertEqual(contract.status_code, 201, contract.json)
         return contract.json, data
 
+    def test_contract_company_settings_permissions_and_generation(self):
+        contract, data = self.make_contract()
+        settings = self.owner.get('/api/contracts/company').json
+        self.assertEqual(settings['revision'], 0)
+        self.assertEqual(settings['company']['name'], 'Синтетическая КСГ')
+        member, _ = self.ready_member()
+        self.assertEqual(member.get('/api/contracts/company').status_code, 403)
+        payload = dict(company=dict(settings['company'], name='Обновлённое название КСГ'), revision=0)
+        self.assertEqual(self.post(member, '/api/contracts/company', payload, 'PUT').status_code, 403)
+        self.assertEqual(self.post(self.owner, '/api/contracts/company', payload, 'PUT').status_code, 200)
+        self.assertEqual(self.post(self.owner, '/api/contracts/company', payload, 'PUT').status_code, 409)
+        result = self.post(self.owner, '/api/contracts', data)
+        self.assertEqual(result.status_code, 201)
+        registry = {c['id']: c for c in self.owner.get('/api/contracts').json['contracts']}
+        self.assertEqual(registry[contract['id']]['snapshot']['company.name'], 'Синтетическая КСГ')
+        self.assertEqual(registry[result.json['id']]['snapshot']['company.name'], 'Обновлённое название КСГ')
+
     def test_contract_generation_links_status_and_pdf(self):
         import io
         import shutil
