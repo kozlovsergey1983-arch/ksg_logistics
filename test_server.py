@@ -324,12 +324,19 @@ class CRMTest(unittest.TestCase):
         self.assertEqual(third.get(path).status_code, 404)
         self.assertEqual(third.get('/api/chat?peer=' + owner_id).json['messages'], [])
         self.assertEqual(third.get('/api/chat/unread').json['conversations'], [])
+        third_dialogs = third.get('/api/chat/dialogs').json['dialogs']
+        self.assertFalse(any(d.get('preview') == 'Личное' for d in third_dialogs))
+        dialogs = member.get('/api/chat/dialogs').json['dialogs']
+        private = next(d for d in dialogs if d['peer'] == owner_id)
+        self.assertEqual((private['preview'], private['count']), ('Личное', 1))
         self.assertEqual(member.get(path).data, b'test file')
         self.assertEqual(member.get('/api/chat?peer=' + owner_id).json['messages'][0]['card_id'], 'company')
         self.assertEqual(member.get('/api/chat/unread').json['conversations'][0]['count'], 1)
         self.assertEqual(self.post(member, '/api/chat/read', dict(ids=[mid])).status_code, 200)
         self.assertEqual(self.post(member, '/api/chat/read', dict(ids=[mid])).status_code, 200)
         self.assertEqual(member.get('/api/chat/unread').json['conversations'], [])
+        dialogs = member.get('/api/chat/dialogs').json['dialogs']
+        self.assertEqual(next(d for d in dialogs if d['peer'] == owner_id)['count'], 0)
         self.assertEqual(self.owner.get('/api/chat?peer=' + member_id).json['messages'][0]['read_count'], 1)
         mobile = self.app.test_client()
         self.login(mobile, 'mobile:worker', 'worker-changed-test-password')

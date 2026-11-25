@@ -30,3 +30,46 @@ dialog:has(.route-viewer){width:1100px;max-width:95vw}.route-viewer iframe{width
 .calendar-grid .active {font-weight: bold; border-color: currentColor}
 .calendar-grid [aria-current=date] {text-decoration: underline}
 .calendar-weekday {text-align: center}
+
+.chat-workspace {max-width: 760px; margin: 0 auto; color: #132e2c; background: #f3f6f5; border: 1px solid #e1e9e5; border-radius: 18px; overflow: hidden}
+.chat-workspace [hidden] {display: none !important}
+.chat-workspace .chat-top {height: auto; min-height: 64px; padding: 12px 16px; display: flex; gap: 12px; align-items: center; justify-content: space-between; background: white; color: #132e2c}
+.chat-top h1 {margin: 0; font-size: 21px; overflow-wrap: anywhere}
+.chat-top small {color: #526761}
+#chatList {padding: 12px 0}
+#chatSearch {display: block; width: calc(100% - 28px); min-height: 44px; margin: 0 14px 12px; font-size: 16px}
+#chatDialogs:empty {min-height: 44px}
+#chatDialogs .chat-dialog {
+    display: grid; grid-template-columns: 42px minmax(0, 1fr) auto; align-items: center; gap: 10px;
+    padding: 10px 14px; width: 100%; min-height: 65px; border: 0; border-bottom: 1px solid #e1e9e5;
+    border-radius: 0; background: white; color: #132e2c; text-align: left;
+}
+#chatDialogs .chat-dialog:hover, #chatDialogs .chat-dialog.chat-unread {background: #e5f4ed}
+.chat-avatar {display: grid; place-items: center; height: 40px; border-radius: 50%; color: #08705e; background: #e5f4ed; font-weight: 700}
+.chat-dialog-name {min-width: 0; overflow-wrap: anywhere}
+.chat-dialog-name strong {font-size: 15px}
+.chat-dialog-name small {display: block; color: #526761; font-size: 13px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap}
+.chat-dialog-meta {display: grid; justify-items: end; gap: 4px; color: #526761; font-size: 12px}
+.chat-counter {color: white; background: #08705e; padding: 1px 7px; border-radius: 999px; font-weight: 700}
+.chat-log {height: clamp(180px, 52vh, 610px); overflow: auto; overscroll-behavior: contain; padding: 10px 14px}
+.chat-log #chatMessages {display: flex; flex-direction: column; gap: 8px; min-height: 100%; max-height: none; overflow: visible; margin: 0}
+#chatHistory {display: block; margin: 0 auto 10px}
+.chat-date, .chat-unread-line {color: #526761; font-size: 12px; text-align: center; padding: 5px 0}
+.chat-unread-line {color: #08705e; font-weight: 700; border-bottom: 1px solid #b9dcd0}
+.chat-bubble {align-self: flex-start; max-width: 86%; min-width: 84px; background: white; padding: 8px 12px; border-radius: 14px; overflow-wrap: anywhere; font-size: 16px; line-height: 1.42}
+.chat-bubble.mine {align-self: flex-end; background: #dff2e9}
+.chat-bubble strong {font-size: 13px; color: #08705e}
+.chat-bubble p {color: #132e2c; margin: 0}
+.chat-bubble small {display: block; text-align: right; color: #526761; font-size: 11px; margin-top: 4px}
+.chat-bubble a {display: block}
+.chat-workspace #chatForm {display: block; background: white; margin: 0; padding: 8px; border-top: 1px solid #e1e9e5}
+.chat-composer {display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: end; gap: 6px}
+.chat-composer button {padding: 7px 9px; min-height: 44px}
+.chat-composer textarea {min-width: 0; min-height: 44px; max-height: 120px; margin: 0; resize: vertical; font-size: 16px; padding: 9px 8px}
+#chatAttachment {display: grid; gap: 8px; padding: 8px 0 0}
+@media(max-width: 560px) {
+    .chat-workspace .chat-top {padding-inline: 10px; gap: 6px}
+    .chat-top h1 {font-size: 18px}
+    .chat-log {height: clamp(180px, 47dvh, 520px); padding-inline: 10px}
+    .chat-bubble {max-width: 90%}
+}

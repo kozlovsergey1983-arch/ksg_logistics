@@ -139,105 +139,262 @@ function taskReminders() {
     }
 }
 
-let chatPeer = '', chatPolling = false, previousUnread = 0, syncActor = '';
+let chatPeer = null, previousUnread = 0, syncActor = '';
 let chatPages = new Map(), chatBefore = '', viewingHistory = false;
+let chatDialogs = [], chatRequest = 0, unreadBoundary = '', chatReadBusy = false;
+
 function chatShell() {
-    return heading('Мессенджер', 'Общий чат команды и личные переписки',
-        '<button onclick="enableNotifications()">Уведомления браузера</button>') +
-        `<section class="panel"><label>Чат <select id="chatPeer" onchange="chatSelect(this.value)"><option value="">Общий чат</option></select></label>
-        <button id="chatHistory" hidden onclick="loadChat(true)">Предыдущие сообщения</button>
-        <div id="chatMessages" aria-live="polite"></div>
-        <form id="chatForm" onsubmit="sendChat(this);return false">
-        <label>Сообщение<textarea name="text" maxlength="10000"></textarea></label>
-        <label>Фото или файл<input name="file" type="file"></label>
-        <label>Карточка<select name="card">${options([['', 'Без карточки'],
-            ...db.partners.map(p => ['partners:' + p.id, 'Контрагент · ' + p.name]),
-            ...db.deals.map(d => ['deals:' + d.id, 'Сделка · ' + d.name])], '')}</select></label>
-        <button class="primary">Отправить</button></form></section>`;
+    return `<section class="chat-workspace">
+        <header class="chat-top"><button type="button" id="chatBack" hidden onclick="chatSelect(null)">‹ Назад</button>
+        <div><h1 id="chatTitle">Мессенджер</h1><small id="chatPresence"></small></div>
+        <button type="button" id="chatBell" aria-label="Уведомления браузера" onclick="enableNotifications()">🔔</button></header>
+        <div id="chatList"><input type="search" id="chatSearch" placeholder="Найти сотрудника" aria-label="Найти сотрудника" oninput="renderDialogs()">
+        <div id="chatDialogs" aria-live="polite">Загрузка диалогов…</div></div>
+        <div id="chatThread" hidden>
+          <div class="chat-log" id="chatLog" onscroll="markVisibleChat()">
+            <button type="button" id="chatHistory" hidden onclick="loadChat(true)">Предыдущие сообщения</button>
+            <div id="chatMessages" aria-live="polite"></div>
+          </div>
+          <form id="chatForm" onsubmit="sendChat(this);return false">
+            <div class="chat-composer">
+                <button type="button" aria-label="Добавить вложение" onclick="toggleChatAttachment()">＋</button>
+                <textarea name="text" rows="1" maxlength="10000" placeholder="Сообщение" aria-label="Сообщение"></textarea>
+                <button type="submit" class="primary">Отправить</button>
+            </div>
+            <div id="chatAttachment" hidden>
+              <label>Фото или файл<input name="file" type="file"></label>
+              <label>Карточка<select name="card">${options([['', 'Без карточки'],
+                ...db.partners.map(p => ['partners:' + p.id, 'Контрагент · ' + p.name]),
+                ...db.deals.map(d => ['deals:' + d.id, 'Сделка · ' + d.name])], '')}</select></label>
+            </div>
+          </form>
+        </div></section>`;
 }
 
 async function enableNotifications() {
     if (!window.Notification) return toast('Системные уведомления недоступны в этом браузере');
-    if (await Notification.requestPermission() !== 'granted') toast('Уведомления остаются доступны в CRM');
+    try {
+        if (await Notification.requestPermission() !== 'granted') toast('Уведомления остаются доступны в CRM');
+    } catch {
+        toast('В Android включи уведомления через настройки приложения');
+    }
 }
 
 function resetChatHistory() {
+    chatRequest++;
     chatPages.clear();
     chatBefore = '';
+    unreadBoundary = '';
     viewingHistory = false;
+}
+
+function resetChat() {
+    chatPeer = null;
+    chatDialogs = [];
+    resetChatHistory();
+}
+
+function showChatNavCount(count) {
+    const nav = $('#chatNav');
+    const title = 'Мессенджер' + (count ? ' (' + count + ')' : '');
+    if (nav && nav.textContent !== title) nav.textContent = title;
+}
+
+function renderDialogs() {
+    const target = $('#chatDialogs');
+    if (!target) return;
+    const query = $('#chatSearch').value.trim().toLocaleLowerCase('ru');
+    const visible = chatDialogs.filter(dialog => dialog.name.toLocaleLowerCase('ru').includes(query));
+    const snapshot = JSON.stringify([query, visible]);
+    if (target.renderedDialogs === snapshot) return;
+    target.renderedDialogs = snapshot;
+    const buttons = visible.map(dialog => {
+        const initials = dialog.peer ? dialog.name.split(/\s+/).slice(0, 2).map(word => word[0]).join('') : 'КСГ';
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'chat-dialog' + (dialog.count ? ' chat-unread' : '');
+        button.innerHTML = `<span class="chat-avatar" aria-hidden="true">${esc(initials)}</span>
+            <span class="chat-dialog-name"><strong>${esc(dialog.name)}</strong>
+            <small>${esc(dialog.preview || (dialog.peer ? 'Начать переписку' : 'Сообщений пока нет'))}</small></span>
+            <span class="chat-dialog-meta">${dialog.created ? `<time>${chatTime(dialog.created, true)}</time>` : ''}
+            ${dialog.count ? `<span class="chat-counter" aria-label="Непрочитанных: ${dialog.count}">${dialog.count}</span>` : ''}</span>`;
+        button.onclick = () => chatSelect(dialog.peer);
+        return button;
+    });
+    if (buttons.length) target.replaceChildren(...buttons);
+    else target.textContent = query ? 'Сотрудники не найдены' : 'Диалогов пока нет';
+}
+
+async function refreshDialogs() {
+    const actor = currentUser?.id;
+    const target = $('#chatDialogs');
+    if (!actor || !target) return;
+    try {
+        const result = await api('/chat/dialogs');
+        if (currentUser?.id !== actor || $('#chatDialogs') !== target) return;
+        chatDialogs = result.dialogs;
+        renderDialogs();
+        const dialog = chatDialogs.find(d => d.peer === chatPeer);
+        if (chatPeer !== null && dialog) {
+            $('#chatPresence').textContent = dialog.online ? 'В сети' : dialog.active ? '' : 'Сотрудник отключён';
+        }
+        showChatNavCount(chatDialogs.reduce((sum, dialog) => sum + dialog.count, 0));
+    } catch (error) {
+        if ($('#chatDialogs') === target && !chatDialogs.length) target.textContent = error.message;
+    }
 }
 
 function chatSelect(peer) {
     chatPeer = peer;
     resetChatHistory();
-    $('#chatMessages').innerHTML = '';
-    $('#chatMessages').renderedMessages = '';
+    const dialog = chatDialogs.find(d => d.peer === peer);
+    $('#chatList').hidden = peer !== null;
+    $('#chatThread').hidden = peer === null;
+    $('#chatBack').hidden = peer === null;
+    $('#chatBell').hidden = peer !== null;
+    $('#chatTitle').textContent = peer === null ? 'Мессенджер' : dialog?.name || 'Переписка';
+    $('#chatPresence').textContent = dialog?.online ? 'В сети' : '';
+    $('#chatForm').reset();
+    $('#chatAttachment').hidden = true;
     $('#chatHistory').hidden = true;
-    loadChat();
+    $('#chatMessages').textContent = 'Загрузка…';
+    $('#chatMessages').renderedMessages = null;
+    if (peer === null) refreshDialogs();
+    else loadChat();
+}
+
+function chatTime(timestamp, withDate = false) {
+    const date = new Date(timestamp);
+    const zone = {timeZone: 'Europe/Moscow'};
+    if (withDate && date.toLocaleDateString('sv-SE', zone) !== today()) {
+        return date.toLocaleDateString('ru-RU', {...zone, day: '2-digit', month: '2-digit'});
+    }
+    return date.toLocaleTimeString('ru-RU', {...zone, hour: '2-digit', minute: '2-digit'});
+}
+
+function renderChatMessages(target, actor, older, initial) {
+    const log = $('#chatLog');
+    const messages = [...chatPages.values()].sort((a, b) => a.created - b.created || (a.id < b.id ? -1 : 1));
+    let lastDay = '';
+    const content = messages.map(message => {
+        const mine = message.sender === actor;
+        const day = new Date(message.created).toLocaleDateString('ru-RU', {timeZone: 'Europe/Moscow'});
+        const date = day !== lastDay ? `<div class="chat-date">${day}</div>` : '';
+        lastDay = day;
+        const marker = message.id === unreadBoundary ? '<div class="chat-unread-line">Непрочитанные сообщения</div>' : '';
+        const card = message.kind && db[message.kind]?.find(c => c.id === message.card_id);
+        const openCard = message.kind === 'partners' ? 'partnerForm' : 'dealForm';
+        const file = '/api/chat/files/' + encodeURIComponent(message.id);
+        return `${date}${marker}<article class="chat-bubble ${mine ? 'mine' : ''}" data-message="${esc(message.id)}">
+            ${!mine && !chatPeer ? `<strong>${esc(message.sender_name)}</strong>` : ''}
+            ${message.body ? `<p class="chat-text">${esc(message.body)}</p>` : ''}
+            ${message.filename && /\.(?:jpe?g|png|gif|webp)$/i.test(message.filename) ? `<img class="chat-photo" loading="lazy" src="${file}?preview=1" alt="${esc(message.filename)}">` : ''}
+            ${message.filename ? `<a href="${file}">Скачать ${esc(message.filename)}</a>` : ''}
+            ${card ? `<button type="button" onclick="${openCard}('${card.id}')">${esc(card.name)}</button>` : esc(message.title)}
+            <small>${chatTime(message.created)}${mine ? (message.read_count ? ' · Прочитано' : ' · Отправлено') : ''}</small>
+        </article>`;
+    }).join('') || '<p>Сообщений пока нет</p>';
+    if (target.renderedMessages === content) return;
+    const oldHeight = log.scrollHeight;
+    const atBottom = oldHeight - log.clientHeight - log.scrollTop < 40;
+    target.innerHTML = content;
+    target.renderedMessages = content;
+    if (initial && unreadBoundary) {
+        const boundary = target.querySelector('.chat-unread-line');
+        if (boundary) log.scrollTop += boundary.getBoundingClientRect().top - log.getBoundingClientRect().top;
+    } else if (older) log.scrollTop += log.scrollHeight - oldHeight;
+    else if (initial || atBottom) log.scrollTop = log.scrollHeight;
 }
 
 async function loadChat(older = false) {
-    if (!$('#chatMessages') || !currentUser || (older && (chatPolling || !chatBefore))) return;
-    if (chatPolling) return;
-    chatPolling = true;
-    const target = $('#chatMessages'), peer = chatPeer, actor = currentUser.id;
+    const target = $('#chatMessages'), peer = chatPeer, actor = currentUser?.id;
+    if (!target || !actor || peer === null || target.loadingOlder || (older && !chatBefore)) return;
+    if (older) target.loadingOlder = true;
+    const request = ++chatRequest;
     try {
         const query = new URLSearchParams({peer});
         if (older) query.set('before', chatBefore);
-        const [people, result] = await Promise.all([api('/chat/users'), api('/chat?' + query)]);
-        if ($('#chatMessages') !== target || chatPeer !== peer || currentUser?.id !== actor) return;
-        const peers = people.users.filter(u => u.id !== actor).map(u => [u.id, u.name + (u.online ? ' · онлайн' : '')]);
-        if (peer && !peers.some(([id]) => id === peer)) peers.push([peer, 'Неактивный сотрудник']);
-        const peerSelect = $('#chatPeer');
-        if (document.activeElement !== peerSelect) peerSelect.innerHTML = options([['', 'Общий чат'], ...peers], peer);
+        const result = await api('/chat?' + query);
+        if (request !== chatRequest || target !== $('#chatMessages') || currentUser?.id !== actor) return;
+        const initial = target.renderedMessages == null;
         if (older) viewingHistory = true;
         if (older || !viewingHistory) chatBefore = result.before;
         if (!viewingHistory) chatPages.clear();
         for (const message of result.messages) chatPages.set(message.id, message);
+        if (!unreadBoundary) unreadBoundary = result.messages.find(m => m.sender !== actor && !m.read_by_me)?.id || '';
         $('#chatHistory').hidden = !chatBefore;
-        const messages = [...chatPages.values()].sort((a, b) => a.created - b.created || (a.id < b.id ? -1 : 1));
-        const content = messages.map(m => {
-            const card = m.kind && db[m.kind]?.find(c => c.id === m.card_id);
-            const openCard = m.kind === 'partners' ? 'partnerForm' : 'dealForm';
-            return `<div class="row"><div><strong>${esc(m.sender_name)}</strong><p class="chat-text">${esc(m.body)}</p>
-                ${m.filename && /\.(?:jpe?g|png|gif|webp)$/i.test(m.filename) ? `<img class="chat-photo" loading="lazy" src="/api/chat/files/${encodeURIComponent(m.id)}?preview=1" alt="${esc(m.filename)}">` : ''}
-                ${m.filename ? `<a href="/api/chat/files/${encodeURIComponent(m.id)}">Скачать ${esc(m.filename)}</a>` : ''}
-                ${card ? `<button onclick="${openCard}('${card.id}')">${esc(card.name)}</button>` : esc(m.title)}</div>
-                <small>${new Date(m.created).toLocaleString('ru-RU', {timeZone: 'Europe/Moscow'})}
-                ${m.sender === actor && m.read_count ? ' · прочитано (' + m.read_count + ')' : ''}</small></div>`;
-        }).join('') || '<p>Сообщений пока нет</p>';
-        if (target.renderedMessages !== content) {
-            const oldHeight = target.scrollHeight;
-            const nearBottom = oldHeight - target.clientHeight - target.scrollTop < 40;
-            target.innerHTML = content;
-            target.renderedMessages = content;
-            if (older) target.scrollTop += target.scrollHeight - oldHeight;
-            else if (nearBottom) target.scrollTop = target.scrollHeight;
-        }
-        const ids = result.messages.filter(m => m.sender !== actor && !m.read_by_me).map(m => m.id);
-        if (!document.hidden && ids.length) await api('/chat/read', 'POST', {ids});
+        renderChatMessages(target, actor, older, initial);
+        markVisibleChat();
     } catch (error) {
-        if ($('#chatMessages') === target) toast(error.message);
+        if (request === chatRequest && target === $('#chatMessages')) {
+            if (target.renderedMessages == null) target.textContent = error.message;
+            else toast(error.message);
+        }
     } finally {
-        chatPolling = false;
+        if (older) {
+            target.loadingOlder = false;
+            if (request !== chatRequest && target === $('#chatMessages') && chatPeer !== null) loadChat();
+        }
     }
 }
 
+async function markVisibleChat() {
+    const log = $('#chatLog');
+    const actor = currentUser?.id;
+    if (!log || log.closest('[hidden]') || !actor || chatReadBusy || document.hidden || $('#modal').open) return;
+    const bounds = log.getBoundingClientRect();
+    const ids = [...log.querySelectorAll('[data-message]')].filter(node => {
+        const message = chatPages.get(node.dataset.message);
+        if (!message || message.sender === actor || message.read_by_me) return false;
+        const box = node.getBoundingClientRect();
+        return Math.min(box.bottom, bounds.bottom, innerHeight) - Math.max(box.top, bounds.top, 0)
+            >= Math.min(box.height, 32);
+    }).slice(0, 200).map(node => node.dataset.message);
+    if (!ids.length) return;
+    chatReadBusy = true;
+    const peer = chatPeer;
+    try {
+        await api('/chat/read', 'POST', {ids});
+        if (currentUser?.id !== actor) return;
+        if (chatPeer === peer) ids.forEach(id => {
+            const message = chatPages.get(id);
+            if (message) message.read_by_me = 1;
+        });
+        await refreshDialogs();
+    } catch {
+        // The next scroll or refresh retries receipts.
+    } finally {
+        chatReadBusy = false;
+    }
+}
+
+function toggleChatAttachment() {
+    const panel = $('#chatAttachment');
+    panel.hidden = !panel.hidden;
+}
+
 async function sendChat(form) {
-    const button = form.querySelector('button');
-    button.disabled = true;
-    const payload = new FormData(form);
-    payload.set('peer', chatPeer);
+    const button = form.querySelector('[type=submit]');
+    if (button.disabled || chatPeer === null) return;
+    const payload = new FormData(form), peer = chatPeer;
+    payload.set('peer', peer);
     const [kind, id] = payload.get('card').split(':');
     if (id) {
         payload.set('kind', kind);
         payload.set('card_id', id);
     }
     if (!payload.get('file')?.size) payload.delete('file');
+    if (!payload.get('text').trim() && !payload.has('file') && !id) return;
+    button.disabled = true;
     try {
         await multipart('/chat', payload);
-        form.reset();
-        await loadChat();
+        if ($('#chatForm') === form && chatPeer === peer) {
+            form.reset();
+            $('#chatAttachment').hidden = true;
+            await loadChat();
+            if (chatPeer === peer && $('#chatLog')) $('#chatLog').scrollTop = $('#chatLog').scrollHeight;
+        }
+        refreshDialogs();
     } catch (error) {
         toast(error.message);
     } finally {
@@ -252,22 +409,19 @@ async function pollCrm() {
     if (syncActor !== actor) {
         syncActor = actor;
         previousUnread = 0;
-        chatPeer = '';
-        resetChatHistory();
     }
     backgroundBusy = true;
     try {
         const unread = await api('/chat/unread');
         if (currentUser?.id !== actor) return;
         const count = unread.conversations.reduce((sum, peer) => sum + peer.count, 0);
-        const nav = $('#chatNav');
-        if (nav) nav.textContent = 'Мессенджер' + (count ? ' (' + count + ')' : '');
+        showChatNavCount(count);
         if (count > previousUnread && (page !== 'Мессенджер' || document.hidden)) {
             toast('Новые сообщения · ' + count);
             if (window.Notification?.permission === 'granted') new Notification('Сообщения КСГ', {body: 'Непрочитанных: ' + count});
         }
         previousUnread = count;
-        if (page === 'Мессенджер') await loadChat();
+        if (page === 'Мессенджер') await Promise.all([refreshDialogs(), loadChat()]);
         if (!busy && !$('#modal').open && ['Обзор', 'Календарь', 'Задачи и звонки'].includes(page)) {
             const baseline = revision;
             const next = await api('/state');

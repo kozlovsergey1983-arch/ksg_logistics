@@ -41,6 +41,48 @@ def register_chat(app, db):
                 GROUP BY CASE WHEN m.recipient='' THEN '' ELSE m.sender END""", (me, me, me)).fetchall()
         return jsonify(conversations=[dict(row) for row in rows])
 
+    @app.get('/api/chat/dialogs')
+    def chat_dialogs():
+        me = g.user['id']
+        now = int(time.time())
+        with db() as q:
+            touch(q)
+            users = q('''SELECT u.id,u.name,u.active,p.seen FROM users u
+                         LEFT JOIN chat_presence p ON p.user_id=u.id WHERE u.id<>?''', (me,)).fetchall()
+            rows = q('''WITH scoped AS (
+                SELECT m.id, m.created, substr(m.body,1,160) AS preview,
+                    CASE WHEN m.recipient='' THEN '' WHEN m.sender=? THEN m.recipient ELSE m.sender END AS peer,
+                    CASE WHEN m.sender<>? AND r.user_id IS NULL THEN 1 ELSE 0 END AS unread
+                FROM chat_messages m LEFT JOIN chat_reads r ON r.message_id=m.id AND r.user_id=?
+                WHERE m.recipient IN ('',?) OR m.sender=?
+            ), ranked AS (
+                SELECT scoped.*, SUM(unread) OVER (PARTITION BY peer) AS count,
+                    ROW_NUMBER() OVER (PARTITION BY peer ORDER BY created DESC,id DESC) AS position
+                FROM scoped
+            )
+            SELECT r.peer,r.created,r.preview,r.count,f.name AS filename,c.title
+            FROM ranked r LEFT JOIN chat_files f ON f.message_id=r.id
+            LEFT JOIN chat_cards c ON c.message_id=r.id WHERE r.position=1
+            ORDER BY r.created DESC,r.id DESC''', (me, me, me, me, me)).fetchall()
+        roster = {u['id']: u for u in users}
+        dialogs = []
+        used = set()
+        for row in rows:
+            peer = row['peer']
+            user = roster.get(peer)
+            dialogs.append(dict(peer=peer, name=user['name'] if user else 'Общий чат' if not peer else 'Сотрудник',
+                                online=bool(user and user['active'] and (user['seen'] or 0) >= now-60),
+                                active=not peer or bool(user and user['active']),
+                                count=row['count'], created=row['created'],
+                                preview=row['preview'] or row['filename'] or row['title'] or 'Сообщение'))
+            used.add(peer)
+        if '' not in used:
+            dialogs.append(dict(peer='', name='Общий чат', active=True, count=0))
+        dialogs.sort(key=lambda dialog: bool(dialog['peer']))
+        dialogs.extend(dict(peer=u['id'], name=u['name'], active=True, count=0, online=(u['seen'] or 0) >= now-60)
+                       for u in sorted(users, key=lambda u: u['name'].casefold()) if u['active'] and u['id'] not in used)
+        return jsonify(dialogs=dialogs)
+
     @app.get('/api/chat')
     def chat_read():
         peer = request.args.get('peer', '')
