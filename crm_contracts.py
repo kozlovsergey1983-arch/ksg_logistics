@@ -166,8 +166,10 @@ def register_contracts(app, db, admin, audit):
             if linked_deal and linked_deal.get('partnerId') and linked_deal['partnerId'] != partner:
                 abort(400, 'Выбери контрагента сделки')
             company = app.config['CONTRACT_COMPANY']
-            if not company.get('name') or not company.get('inn') or not counterparty.get('inn'):
-                abort(409, 'Заполни название и ИНН своей организации и ИНН контрагента')
+            if not str(counterparty.get('inn') or '').strip():
+                abort(409, 'Укажи ИНН в карточке контрагента')
+            if not str(company.get('name') or '').strip() or not str(company.get('inn') or '').strip():
+                abort(409, 'Укажи название и ИНН своей организации в CONTRACT_COMPANY_JSON')
             now = datetime.now(MOSCOW)
             sequence = q('''INSERT INTO contract_sequence VALUES (?,1)
                           ON CONFLICT(year) DO UPDATE SET value=contract_sequence.value+1 RETURNING value''',

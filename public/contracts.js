@@ -85,26 +85,62 @@ async function contractForm(partner = '', deal = '') {
         const parties = db.partners.filter(p => !p.archived && !p.deletionRequested).map(p => [p.id, p.name]);
         form('Сформировать договор',
             `<label>Шаблон<select name="template" required>${options(templates.map(t => [t.id, t.name]), '')}</select></label>
-            <label>Контрагент<select name="partner" required>${options([['', 'Выбери контрагента'], ...parties], partner || selected?.partnerId)}</select></label>
+            <div><label>Контрагент<select name="partner" required onchange="refreshContractPartner(this.form)">${options([['', 'Выбери контрагента'], ...parties], partner || selected?.partnerId)}</select></label>
+            <button type="button" data-contract-partner onclick="openContractPartner(this.form)">Открыть карточку</button>
+            <small data-contract-inn aria-live="polite"></small></div>
             <label>Сделка<select name="deal" onchange="contractDealChanged(this.form)">${options([['', 'Без сделки'], ...db.deals.map(d => [d.id, d.name])], deal)}</select></label>` +
             field('route', 'Маршрут', selected?.name) + field('rate', 'Ставка', selected?.client) +
             field('cargo', 'Груз', selected?.cargo) + field('payment', 'Условия оплаты', selected?.details),
             'saveContract(this)');
+        refreshContractPartner($('#modal form'));
     } catch (error) {
         toast(error.message);
     }
+}
+
+function refreshContractPartner(form) {
+    const partner = db.partners.find(p => p.id === form.elements.partner.value);
+    form.querySelector('[data-contract-partner]').disabled = !partner;
+    form.querySelector('[data-contract-inn]').textContent = partner ?
+        (partner.inn?.trim() ? 'ИНН ' + partner.inn : 'ИНН не указан') : '';
+    return partner;
+}
+
+function openContractPartner(form, focusInn = false) {
+    const partner = refreshContractPartner(form);
+    if (!partner) return;
+    const modal = $('#modal'), actor = currentUser?.id;
+    const draft = [...modal.childNodes];
+    partnerForm(partner.id, true);
+    const editor = modal.querySelector('form');
+    editor.querySelector('.actions button[type=button]').textContent = 'Назад к договору';
+    modal.addEventListener('close', () => {
+        if (modal.open || currentUser?.id !== actor) return;
+        modal.replaceChildren(...draft);
+        refreshContractPartner(form);
+        modal.showModal();
+        form.querySelector('[data-contract-partner]').focus();
+    }, {once: true});
+    if (focusInn) editor.elements.inn.focus();
 }
 
 function contractDealChanged(form) {
     const deal = db.deals.find(d => d.id === form.elements.deal.value);
     if (!deal) return;
     if (deal.partnerId) form.elements.partner.value = deal.partnerId;
+    refreshContractPartner(form);
     for (const [field, value] of Object.entries({route: deal.name, rate: deal.client, cargo: deal.cargo, payment: deal.details})) {
         if (!form.elements[field].value) form.elements[field].value = value ?? '';
     }
 }
 
 async function saveContract(form) {
+    const partner = refreshContractPartner(form);
+    if (partner && !partner.inn?.trim()) {
+        toast('Укажи ИНН в карточке контрагента');
+        openContractPartner(form, true);
+        return;
+    }
     const button = form.querySelector('button.primary');
     button.disabled = true;
     try {
